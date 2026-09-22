@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tidal-dl-ultra"
+dynamic = ["version"]
+description = "Downloader de terminal para o Tidal (Lossless/Hi-Res), irmão do qobuz-dl-ultra. Funciona no a-Shell (iOS/iPadOS)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "GPL-3.0-or-later" }
+keywords = ["tidal", "music", "downloader", "flac", "hi-res", "lossless", "a-shell"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: GNU General Public License (GPL)",
+    "Operating System :: OS Independent",
+]
+
+# NÚCLEO 100% Python puro: instala no a-Shell (iOS) sem compilar nada.
+dependencies = [
+    "httpx",
+    "mutagen",
+    "colorama>=0.4.6",
+]
+
+[project.optional-dependencies]
+speed = ["rapidfuzz", "brotli"]
+keyring = ["keyring"]
+all = ["tidal-dl-ultra[speed,keyring]", "platformdirs"]
+dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.6"]
+
+[project.scripts]
+tidal-dl = "tidal_dl.cli:main"
+tdl = "tidal_dl.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "tidal_dl.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["tidal_dl*"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --tb=short"
+markers = [
+    "unit: lógica pura, sem rede",
+    "network: camada HTTP com backend falso (nunca toca a rede real)",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"

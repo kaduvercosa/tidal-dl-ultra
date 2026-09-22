@@ -1,0 +1,4 @@
+# Núcleo (Python puro; instala no a-Shell). Extras: pip install "tidal-dl-ultra[all]"
+httpx
+mutagen
+colorama>=0.4.6
