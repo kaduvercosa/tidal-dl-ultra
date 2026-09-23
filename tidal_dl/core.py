@@ -12,7 +12,6 @@ import os
 from typing import Any, Optional
 
 from tidal_dl import ui
-from tidal_dl.interactive_ui import _align_text, _get_table_layout, _shade, pt_style, prompt_style
 from tidal_dl.api import TidalAPI
 from tidal_dl.auth import CredentialStore, Credentials
 from tidal_dl.downloader import Downloader
@@ -96,10 +95,10 @@ class TidalDL:
                 return (await dl.download_track(item_id)).ok
             if kind == "playlist":
                 return (await dl.download_playlist(str(item_id))).ok
-            if kind == "video":
-                return (await dl.download_video(item_id)).ok
             if kind == "artist":
                 return await self._download_artist(item_id, include_eps)
+            if kind == "video":
+                return (await dl.download_video(item_id)).ok
         except ResourceNotFoundError:
             ui.error(f"{kind} {item_id} não encontrado.")
             return False

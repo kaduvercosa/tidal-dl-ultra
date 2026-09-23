@@ -18,10 +18,10 @@ def test_defaults_validos():
 
 def test_roundtrip_config(tmp_path):
     f = str(tmp_path / "c.ini")
-    st = TidalDLSettings(quality=2, lyrics=False, concurrency=3, delay=1.5, folder_format="{album_title}")
+    st = TidalDLSettings(quality=2, lyrics=False, max_workers=3, delay=1.5, folder_format="{album_title}")
     st.save(f)
     back = TidalDLSettings.from_config(f)
-    assert (back.quality, back.lyrics, back.concurrency, back.delay, back.folder_format) == (2, False, 3, 1.5, "{album_title}")
+    assert (back.quality, back.lyrics, back.max_workers, back.delay, back.folder_format) == (2, False, 3, 1.5, "{album_title}")
     if os.name == "posix":
         assert oct(os.stat(f).st_mode & 0o777) == "0o600"
 
@@ -49,17 +49,17 @@ def test_config_valor_invalido_e_arquivo_ruim(tmp_path):
 
 
 def test_limites_de_concorrencia_e_retries():
-    st = TidalDLSettings(concurrency=99, retries=0)
+    st = TidalDLSettings(max_workers=99, retries=0)
     st.validate()
-    assert st.concurrency == 8 and st.retries == 1
+    assert st.max_workers == 16 and st.retries == 1
 
 
 def test_apply_args_so_sobrepoe_o_que_veio(tmp_path):
-    st = TidalDLSettings(quality=3, concurrency=4)
+    st = TidalDLSettings(quality=3, max_workers=4)
     args = SimpleNamespace(directory=str(tmp_path), quality=0, no_db=True, no_lyrics=True, no_fallback=True,
                            no_cover=True, no_sentinel=True)
     st.apply_args(args)
-    assert st.quality == 0 and st.concurrency == 4 and st.no_database and not st.lyrics
+    assert st.quality == 0 and st.max_workers == 4 and st.no_database and not st.lyrics
     assert not st.allow_quality_fallback and not st.embed_art and not st.write_sentinel
     assert st.directory == str(tmp_path)
 

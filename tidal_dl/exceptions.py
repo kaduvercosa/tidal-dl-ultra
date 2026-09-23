@@ -53,6 +53,10 @@ class DownloadError(TidalDLException):
     """Falha de transferência/remux/verificação."""
 
 
+class PermanentDownloadError(DownloadError):
+    """Erro que repetir não resolve (HTTP 401/403/404/451): não faz retry."""
+
+
 class InvalidQuality(TidalDLException):
     pass
 

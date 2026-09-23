@@ -219,11 +219,13 @@ class TidalAPI:
             raise NonStreamable(str(body.get("userMessage") or "resposta sem manifest"))
         return body
 
+    # -- vídeos --------------------------------------------------------
+
     async def get_video(self, video_id: Any) -> Video:
-        body = await self.get(f"videos/{video_id}")
-        return Video.from_dict(body)
+        return Video.from_dict(await self.get(f"videos/{video_id}"))
 
     async def video_playback_info(self, video_id: Any, video_quality: str = "HIGH") -> dict:
+        """``video_quality``: ``LOW`` | ``MEDIUM`` | ``HIGH`` (enum da API, não resolução)."""
         body = await self.get(
             f"videos/{video_id}/playbackinfopostpaywall",
             {"videoquality": video_quality, "playbackmode": "STREAM", "assetpresentation": "FULL"},

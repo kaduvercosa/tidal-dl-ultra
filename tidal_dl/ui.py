@@ -170,6 +170,11 @@ def unicode_enabled():
     return _unicode_enabled
 
 
+def is_quiet():
+    """True quando --quiet está ativo (barras de progresso também ficam mudas)."""
+    return _quiet
+
+
 def configure(quiet=None, verbose=None, color=None, unicode=None):
     # Ponto único de ajuste do comportamento global da UI. Chamado uma vez,
     # no boot da CLI, com os valores vindos dos argumentos de linha de

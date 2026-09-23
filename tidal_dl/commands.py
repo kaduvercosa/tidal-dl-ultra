@@ -69,17 +69,26 @@ def add_common_arg(p: argparse.ArgumentParser) -> None:
     p.add_argument("-d", "--directory", metavar="PASTA", default=None, help="pasta de downloads")
     p.add_argument("-q", "--quality", metavar="N", type=int, choices=range(5), default=None,
                    help=_quality_help())
+    p.add_argument("--video-directory", metavar="PASTA", default=None,
+                   help="pasta de downloads de vídeo (padrão: TidalVideos)")
+    p.add_argument("--video-quality", choices=["low", "medium", "high", "LOW", "MEDIUM", "HIGH"],
+                   default=None, help="qualidade de vídeo (padrão: high)")
     p.add_argument("-ff", "--folder-format", metavar="FMT", default=None, help="formato do nome da pasta")
     p.add_argument("-tf", "--track-format", metavar="FMT", default=None, help="formato do nome da faixa")
-    p.add_argument("--concurrency", type=int, metavar="N", default=None,
-                   help="faixas simultâneas (padrão 2; use 1 em conexões ruins)")
-    p.add_argument("--delay", type=float, metavar="SEG", default=None, help="pausa entre faixas")
+    p.add_argument("--max-workers", "--concurrency", dest="max_workers", type=int, metavar="N", default=None,
+                   help="downloads paralelos (padrão: 1 = sequencial, com barra de progresso)")
+    p.add_argument("--delay", type=float, metavar="SEG", default=None,
+                   help="pausa entre faixas (força modo sequencial: Safety Delay)")
+    p.add_argument("--no-progress", action="store_true", default=False,
+                   help="sem barra de progresso (útil em logs/cron)")
     p.add_argument("--remux", choices=["auto", "python", "ffmpeg", "none"], default=None,
                    help="como converter o DASH em FLAC (auto = Python puro, ffmpeg como plano B)")
     p.add_argument("--no-db", action="store_true", default=False, help="ignora o banco de dedup")
     p.add_argument("--no-sentinel", action="store_true", default=False,
                    help="não grava .streamrip.json nas pastas")
     p.add_argument("--no-lyrics", action="store_true", default=False, help="não busca letras")
+    p.add_argument("--no-lyrics-fallback", action="store_true", default=False,
+                   help="não completa letras faltantes no Tidal usando o LRCLIB")
     p.add_argument("--no-cover", action="store_true", default=False, help="não baixa/embute capa")
     p.add_argument("--no-fallback", action="store_true", default=False,
                    help="falha em vez de baixar em qualidade menor quando a pedida não existir")
@@ -105,8 +114,8 @@ def user_args(sub):
 def dl_args(sub):
     p = sub.add_parser(
         "dl", usage="tidal-dl dl [opções] ITEM [ITEM...]", help="baixa por URL ou arquivo .txt",
-        description="Baixa álbuns, faixas, playlists e artistas a partir de URLs do Tidal "
-                    "(ou de um .txt com uma URL por linha).",
+        description="Baixa álbuns, faixas, playlists, artistas e vídeos musicais a partir de URLs "
+                    "do Tidal (ou de um .txt com uma URL por linha).",
     )
     p.add_argument("SOURCE", nargs="+", help="URL(s) do Tidal ou caminho de um .txt")
     p.add_argument("--eps", action="store_true", default=False,
@@ -201,7 +210,6 @@ def stats_args(sub):
 def config_args(sub):
     p = sub.add_parser("config", help="assistente de configuração (config.ini)")
     p.add_argument("--show", action="store_true", default=False, help="só mostra a configuração atual")
-    p.add_argument("--reset", action="store_true", default=False, help="apaga o config.ini")
     return p
 
 
@@ -212,6 +220,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"tidal-dl-ultra {__version__}",
                         help="mostra a versão e sai")
+    parser.add_argument("-r", "--reset", action="store_true", default=False,
+                        help="cria/reseta o arquivo de configuração (assistente interativo)")
+    parser.add_argument("-p", "--purge", action="store_true", default=False,
+                        help="apaga o banco de dados de downloads-já-feitos (tidal_dl.db)")
     parser.add_argument("--quiet", action="store_true", default=False, help="só erros")
     parser.add_argument("--verbose", action="store_true", default=False, help="mensagens de depuração")
     parser.add_argument("--no-color", action="store_true", default=False, help="sem cores")

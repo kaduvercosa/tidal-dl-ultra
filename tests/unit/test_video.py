@@ -1,86 +1,159 @@
-"""Testes de download de vídeos do Tidal."""
+"""Testes de download de vídeo (HLS) via ``Downloader.download_video``."""
 
 import asyncio
 import os
+
 import pytest
 
-from fakes import Response, jresp, make_client
+from fakes import b64, jresp, make_client
+from tidal_dl import auth, db, sentinel
 from tidal_dl.api import TidalAPI
-from tidal_dl.auth import Credentials
 from tidal_dl.downloader import Downloader
-from tidal_dl.manifest import resolve_video_stream
-from tidal_dl.models import Video
+from tidal_dl.exceptions import ResourceNotFoundError
 from tidal_dl.settings import TidalDLSettings
 
-
-def test_video_model():
-    data = {
-        "id": 12345,
-        "title": "Music Video",
-        "artist": {"name": "Artist Name"},
-        "duration": 210,
-        "releaseDate": "2023-05-01T00:00:00.000+0000",
-    }
-    v = Video.from_dict(data)
-    assert v.id == 12345
-    assert v.full_title == "Music Video"
-    assert v.artist_names == "Artist Name"
-    assert v.release_date == "2023-05-01"
+MEDIA = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\nseg0.ts\nseg1.ts\n#EXT-X-ENDLIST\n"
 
 
-def test_resolve_video_stream():
-    manifest_json = '{"urls": ["https://video.tidal.com/stream.m3u8"]}'
-    import base64
-    b64 = base64.b64encode(manifest_json.encode()).decode()
+def run(c):
+    return asyncio.run(c)
+
+
+def make(tmp_path, *, video_id=99, handler=None, **kw):
+    def default_handler(method, url, params, data, headers):
+        if f"videos/{video_id}/playbackinfopostpaywall" in url:
+            return jresp({
+                "assetPresentation": "FULL", "manifestMimeType": "application/vnd.tidal.emu",
+                "manifest": b64('{"urls": ["https://cdn/media.m3u8"]}'),
+            })
+        if f"videos/{video_id}" in url:
+            return jresp({"id": video_id, "title": "Music Video", "artist": {"name": "Artist"},
+                          "releaseDate": "2023-05-01"})
+        return jresp({}, 404)
+
+    client, backend = make_client(handler or default_handler)
+    backend.files["https://cdn/media.m3u8"] = MEDIA.encode()
+    backend.files["https://cdn/seg0.ts"] = b"AAAA"
+    backend.files["https://cdn/seg1.ts"] = b"BBBB"
+    api = TidalAPI(client, auth.Credentials("t", "r", 9e12, "7", "BR"))
+    settings = TidalDLSettings(video_directory=str(tmp_path / "Videos"), **kw)
+    settings.validate()
+    return Downloader(api, settings, db_path=str(tmp_path / "t.db")), backend
+
+
+def test_download_video_completo(tmp_path, capsys):
+    dl, backend = make(tmp_path)
+    res = run(dl.download_video(99))
+    assert res.ok and res.tracks[0].success
+    path = res.tracks[0].path
+    assert path.endswith(".ts") and open(path, "rb").read() == b"AAAABBBB"
+    out = capsys.readouterr().out
+    assert "VÍDEO" in out and "Em Progresso: Artist - Music Video" in out
+    assert "└─ Concluído: Artist - Music Video" in out and "RESUMO DA VÍDEO" in out
+    assert db.is_downloaded(str(tmp_path / "t.db"), 99, "video") == path
+    # sentinela é só para álbuns; vídeo não deve criar uma
+    assert not sentinel.has_sentinel(os.path.dirname(path))
+
+
+def test_download_video_pula_se_ja_baixado(tmp_path):
+    dl, backend = make(tmp_path)
+    res1 = run(dl.download_video(99))
+    dl2, _ = make(tmp_path)
+    dl2.db_path = dl.db_path
+    res2 = run(dl2.download_video(99))
+    assert res2.skipped and res2.tracks[0].path == res1.tracks[0].path
+
+
+def test_download_video_nome_de_arquivo_usa_artista_titulo_ano(tmp_path):
+    dl, _ = make(tmp_path)
+    res = run(dl.download_video(99))
+    assert os.path.basename(res.tracks[0].path) == "Artist - Music Video (2023).ts"
+
+
+def test_download_video_inexistente(tmp_path):
+    def handler(method, url, params, data, headers):
+        return jresp({"userMessage": "nao existe"}, 404)
+
+    dl, _ = make(tmp_path, handler=handler)
+    with pytest.raises(ResourceNotFoundError):
+        run(dl.download_video(99))
+
+
+def test_download_video_com_ffmpeg_ausente_mantem_ts(tmp_path, monkeypatch):
+    from tidal_dl import utils
+
+    monkeypatch.setattr(utils, "encontrar_binario", lambda name: None)
+    dl, _ = make(tmp_path)
+    res = run(dl.download_video(99))
+    assert res.tracks[0].path.endswith(".ts") and res.tracks[0].file_format == "TS"
+
+
+def test_download_video_remux_none_mantem_ts(tmp_path):
+    dl, _ = make(tmp_path, remux="none")
+    res = run(dl.download_video(99))
+    assert res.tracks[0].path.endswith(".ts")
+
+
+def test_download_video_falha_de_stream_registra_erro(tmp_path):
+    def handler(method, url, params, data, headers):
+        if "playbackinfopostpaywall" in url:
+            return jresp({"userMessage": "sem manifest"})
+        if "videos/99" in url:
+            return jresp({"id": 99, "title": "X", "artist": {"name": "A"}})
+        return jresp({}, 404)
+
+    dl, _ = make(tmp_path, handler=handler)
+    res = run(dl.download_video(99))
+    assert not res.ok and "manifest" in res.tracks[0].error.lower()
+    assert not any(f.startswith("~tmp_") for f in os.listdir(dl.settings.video_directory))
+
+
+def test_download_video_com_master_playlist_e_qualidade(tmp_path):
+    master = ("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=500000\nlow.m3u8\n"
+              "#EXT-X-STREAM-INF:BANDWIDTH=5000000\nhigh.m3u8\n")
 
     def handler(method, url, params, data, headers):
-        if "videos/12345/playbackinfopostpaywall" in url:
-            return jresp({
-                "assetPresentation": "FULL",
-                "manifestMimeType": "application/vnd.tidal.emu",
-                "manifest": b64
-            })
-        return jresp({})
+        if "playbackinfopostpaywall" in url:
+            assert params["videoquality"] == "LOW"
+            return jresp({"assetPresentation": "FULL", "manifestMimeType": "application/vnd.tidal.emu",
+                          "manifest": b64('{"urls": ["https://cdn/master.m3u8"]}')})
+        if "videos/99" in url:
+            return jresp({"id": 99, "title": "X", "artist": {"name": "A"}})
+        return jresp({}, 404)
 
-    client, backend = make_client(handler)
-    api = TidalAPI(client, Credentials("t", "r"))
-    stream = asyncio.run(resolve_video_stream(api, 12345, "1080p"))
-    assert stream.track_id == 12345
-    assert stream.is_m3u8 is True
-    assert stream.urls == ["https://video.tidal.com/stream.m3u8"]
+    dl, backend = make(tmp_path, handler=handler, video_quality="low")
+    backend.files["https://cdn/master.m3u8"] = master.encode()
+    backend.files["https://cdn/low.m3u8"] = MEDIA.encode()
+    res = run(dl.download_video(99))
+    assert res.ok
 
 
-def test_download_video_flow(tmp_path):
-    manifest_json = '{"urls": ["https://video.tidal.com/segment1.ts"]}'
-    import base64
-    b64 = base64.b64encode(manifest_json.encode()).decode()
+def test_download_video_segmentos_criptografados(tmp_path):
+    import os as _os
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives import padding as _padding
+
+    key = _os.urandom(16)
+
+    def enc(pt, seq):
+        iv = seq.to_bytes(16, "big")
+        padder = _padding.PKCS7(128).padder()
+        padded = padder.update(pt) + padder.finalize()
+        return Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor().update(padded)
 
     def handler(method, url, params, data, headers):
-        if "videos/12345/playbackinfopostpaywall" in url:
-            return jresp({
-                "assetPresentation": "FULL",
-                "manifestMimeType": "application/vnd.tidal.emu",
-                "manifest": b64
-            })
-        if "videos/12345" in url:
-            return jresp({
-                "id": 12345,
-                "title": "Test Video",
-                "artist": {"name": "Test Artist"}
-            })
-        return jresp({})
+        if "playbackinfopostpaywall" in url:
+            return jresp({"assetPresentation": "FULL", "manifestMimeType": "application/vnd.tidal.emu",
+                          "manifest": b64('{"urls": ["https://cdn/media.m3u8"]}')})
+        if "videos/99" in url:
+            return jresp({"id": 99, "title": "X", "artist": {"name": "A"}})
+        return jresp({}, 404)
 
-    client, backend = make_client(handler)
-    backend.files["https://video.tidal.com/segment1.ts"] = b"VIDEO_TS_DATA_123"
-
-    api = TidalAPI(client, Credentials("t", "r"))
-    settings = TidalDLSettings(video_directory=str(tmp_path / "Videos"))
-    dl = Downloader(api, settings)
-
-    res = asyncio.run(dl.download_video(12345))
-    assert res.ok is True
-    assert len(res.tracks) == 1
-    assert res.tracks[0].success is True
-    assert os.path.exists(res.tracks[0].path)
-    with open(res.tracks[0].path, "rb") as fh:
-        assert fh.read() == b"VIDEO_TS_DATA_123"
+    dl, backend = make(tmp_path, handler=handler)
+    media = ('#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n'
+             '#EXT-X-KEY:METHOD=AES-128,URI="https://cdn/key"\nseg0.ts\n')
+    backend.files["https://cdn/media.m3u8"] = media.encode()
+    backend.files["https://cdn/key"] = key
+    backend.files["https://cdn/seg0.ts"] = enc(b"conteudo secreto do segmento", 0)
+    res = run(dl.download_video(99))
+    assert res.ok and open(res.tracks[0].path, "rb").read() == b"conteudo secreto do segmento"

@@ -109,7 +109,7 @@ def test_retry_de_rede_recupera_segmento(tmp_path):
 
 
 def test_erro_fatal_aborta_e_deixa_incomplete(tmp_path):
-    sc = Scenario(tmp_path, tracks=3, concurrency=1)
+    sc = Scenario(tmp_path, tracks=3, max_workers=1)
     sc.status401_tracks = {2}
     sc.creds.refresh_token = ""  # não há como renovar
     sc.api.creds.refresh_token = ""
@@ -190,3 +190,216 @@ def test_run_limited_cancela_restantes_no_erro():
     with pytest.raises(AuthenticationError):
         run(run_limited([boom(), ok(1), ok(2)], 3))
     assert done == []
+
+
+# ---------------------------------------------------------------------------
+# Modos (sequencial/paralelo), barras de progresso, retomada e resumo
+# ---------------------------------------------------------------------------
+
+from tidal_dl import progress  # noqa: E402
+
+PLAIN = b"fLaC" + b"P" * 200
+
+
+class Spy:
+    """tqdm falso: registra como cada barra foi criada."""
+
+    instances = []
+
+    def __init__(self, **kw):
+        self.kw, self.n = kw, kw.get("initial", 0)
+        Spy.instances.append(self)
+
+    def update(self, n=1):
+        self.n += n
+
+    def set_postfix_str(self, s):
+        pass
+
+    def close(self):
+        pass
+
+
+def spy(monkeypatch):
+    Spy.instances = []
+    monkeypatch.setattr(progress, "_load_tqdm", lambda: Spy)
+
+
+def test_sequencial_dash_mostra_modo_barra_e_montagem(tmp_path, monkeypatch, capsys):
+    spy(monkeypatch)
+    sc = Scenario(tmp_path)  # padrão: max_workers=1
+    res = run(sc.downloader().download_album(10))
+    out = capsys.readouterr().out
+    assert res.ok
+    assert "Sequencial" in out and "Paralelo" not in out
+    assert "Em Progresso: [1/2] Song1" in out and "└─ Concluído: [1/2] Song1" in out
+    assert "Montando o arquivo FLAC final" in out
+    assert len(Spy.instances) == 2 and all(b.kw["unit"] == " seg" and b.kw["total"] == 3 for b in Spy.instances)
+    assert "RESUMO DA ÁLBUM" in out and "2/2" in out
+
+
+def test_sequencial_bts_barra_em_bytes(tmp_path, monkeypatch, capsys):
+    spy(monkeypatch)
+    sc = Scenario(tmp_path, quality="LOSSLESS", quality_=None) if False else Scenario(tmp_path, quality="LOSSLESS")
+    sc.settings.quality = 2
+    res = run(sc.downloader().download_album(10))
+    assert res.ok and open(res.tracks[0].path, "rb").read() == PLAIN
+    kws = [b.kw for b in Spy.instances]
+    assert len(kws) == 2 and all(k["unit"] == "iB" and k["total"] == len(PLAIN) for k in kws)
+
+
+def test_paralelo_sem_barras_mas_com_linhas_de_progresso(tmp_path, monkeypatch, capsys):
+    spy(monkeypatch)
+    sc = Scenario(tmp_path, max_workers=2)
+    res = run(sc.downloader().download_album(10))
+    out = capsys.readouterr().out
+    assert res.ok and "Paralelo (2 workers)" in out
+    assert Spy.instances == []
+    assert "Em Progresso: [1/2] Song1 [3 segmentos]" in out and "└─ Concluído: [2/2] Song2" in out
+    assert "Montando o arquivo FLAC final" not in out
+
+
+def test_paralelo_bts_mostra_tamanho(tmp_path, capsys):
+    sc = Scenario(tmp_path, quality="LOSSLESS", max_workers=2)
+    sc.settings.quality = 2
+    run(sc.downloader().download_album(10))
+    assert "Em Progresso: [1/2] Song1 [0.0 MB]" in capsys.readouterr().out
+
+
+def test_delay_forca_sequencial_e_espera_entre_faixas(tmp_path, capsys):
+    waited = []
+
+    async def sleep(s):
+        waited.append(s)
+
+    sc = Scenario(tmp_path, max_workers=4, delay=0.5)
+    res = run(sc.downloader(sleep=sleep).download_album(10))
+    assert res.ok and "Sequencial (Safety Delay ativo)" in capsys.readouterr().out
+    assert waited == [0.5, 0.5]
+
+
+def test_no_progress_desliga_a_barra(tmp_path, monkeypatch):
+    spy(monkeypatch)
+    sc = Scenario(tmp_path, progress_bar=False)
+    assert run(sc.downloader().download_album(10)).ok and Spy.instances == []
+
+
+def test_faixa_avulsa_mostra_cabecalho_e_modo(tmp_path, capsys):
+    sc = Scenario(tmp_path)
+    run(sc.downloader().download_track(1))
+    out = capsys.readouterr().out
+    assert "FAIXA" in out and "Sequencial" in out and "Song1" in out
+
+
+def test_retomada_bts_com_range_apos_queda(tmp_path, capsys):
+    sc = Scenario(tmp_path, tracks=1, quality="LOSSLESS", retries=3)
+    sc.settings.quality = 2
+    sc.backend.cut["https://cdn/1/plain.flac"] = 100
+    res = run(sc.downloader().download_album(10))
+    assert res.ok and open(res.tracks[0].path, "rb").read() == PLAIN  # sem bytes duplicados
+    ranges = [(c[4] or {}).get("Range") for c in sc.backend.calls if c[0] == "STREAM" and c[1].endswith("plain.flac")]
+    assert ranges == [None, "bytes=100-"]
+    assert "Falha de Rede. Tentativa 2/3" in capsys.readouterr().out
+
+
+def test_servidor_que_ignora_range_recomeca_do_zero(tmp_path):
+    sc = Scenario(tmp_path, tracks=1, quality="LOSSLESS", retries=3)
+    sc.settings.quality = 2
+    sc.backend.honor_range = False
+    sc.backend.cut["https://cdn/1/plain.flac"] = 100
+    res = run(sc.downloader().download_album(10))
+    assert res.ok and open(res.tracks[0].path, "rb").read() == PLAIN
+
+
+def test_retomada_dash_continua_no_segmento_que_faltava(tmp_path):
+    sc = Scenario(tmp_path, tracks=1, retries=3)
+    sc.backend.cut["https://cdn/1/seg2.m4s"] = 3
+    res = run(sc.downloader().download_album(10))
+    assert res.ok and open(res.tracks[0].path, "rb").read()[:4] == b"fLaC"
+    hits = lambda name: sum(1 for c in sc.backend.calls if c[0] == "STREAM" and c[1].endswith(name))
+    assert hits("init.mp4") == 1 and hits("seg1.m4s") == 1 and hits("seg2.m4s") == 2
+
+
+def test_erro_permanente_nao_repete(tmp_path, capsys):
+    sc = Scenario(tmp_path, tracks=1, quality="LOSSLESS", retries=5)
+    sc.settings.quality = 2
+    del sc.backend.files["https://cdn/1/plain.flac"]
+    res = run(sc.downloader().download_album(10))
+    assert not res.ok and "HTTP 404" in res.tracks[0].error
+    assert sum(1 for c in sc.backend.calls if c[0] == "STREAM") == 1
+    assert "Falha de Rede" not in capsys.readouterr().out
+
+
+def test_resumo_mostra_puladas_falhas_e_fallback(tmp_path, capsys):
+    sc = Scenario(tmp_path, retries=1)
+    run(sc.downloader().download_album(10))          # 1ª vez: tudo baixado
+    capsys.readouterr()
+    sc.protected = set()
+    (tmp_path / "x").mkdir()
+    import shutil
+    shutil.rmtree(os.path.join(sc.dir, "Album"))     # apaga tudo e refaz com fallback + falha
+    sc.protected = {(1, "HI_RES_LOSSLESS")}
+    sc.forbidden = {(2, q) for q in ("HI_RES_LOSSLESS", "HI_RES", "LOSSLESS", "HIGH", "LOW")}
+    import tidal_dl.db as dbm
+    dbm.purge(sc.db)
+    run(sc.downloader().download_album(10))
+    out = capsys.readouterr().out
+    assert "Baixadas com sucesso : " in out and "1/2" in out
+    assert "Em qualidade menor (fallback) : " in out and "Falhas : " in out
+
+
+def test_abort_por_ctrl_c_limpa_temporarios(tmp_path):
+    from tidal_dl.downloader import Downloader
+
+    class Aborta(Downloader):
+        async def _fetch_segment(self, url):
+            data = await super()._fetch_segment(url)
+            if url.endswith("seg1.m4s"):
+                progress.abort_event.set()
+            return data
+
+    sc = Scenario(tmp_path, tracks=1)
+    with pytest.raises(KeyboardInterrupt):
+        run(Aborta(sc.api, sc.settings, db_path=sc.db).download_album(10))
+    assert not any("~tmp_" in f for f in files(sc.dir))
+    assert db.is_downloaded(sc.db, 10, "album") is None
+
+
+def test_fallback_lrclib_quando_tidal_nao_tem_letra(tmp_path):
+    from fakes import jresp
+
+    sc = Scenario(tmp_path, tracks=1)
+    orig = sc.backend.handler
+
+    def handler(method, url, params, data, headers):
+        if url.endswith("/lyrics"):
+            return jresp({}, 404)  # Tidal sem letra
+        if url == "https://lrclib.net/api/get":
+            return jresp({"plainLyrics": "letra de reforco", "syncedLyrics": ""})
+        return orig(method, url, params, data, headers)
+
+    sc.backend.handler = handler
+    res = run(sc.downloader().download_album(10))
+    assert res.ok
+    lrc_or_txt = res.tracks[0].path.rsplit(".", 1)[0]
+    from tidal_dl import metadata as _md  # só para import válido no bloco
+    # confere que a letra de fallback foi de fato usada nas tags do FLAC (mutagen ausente:
+    # o efeito observável aqui é indireto -- então validamos via chamada registrada)
+    assert any(c[1] == "https://lrclib.net/api/get" for c in sc.backend.calls)
+
+
+def test_sem_fallback_lrclib_quando_desligado(tmp_path):
+    from fakes import jresp
+
+    sc = Scenario(tmp_path, tracks=1, lyrics_fallback=False)
+    orig = sc.backend.handler
+
+    def handler(method, url, params, data, headers):
+        if url.endswith("/lyrics"):
+            return jresp({}, 404)
+        return orig(method, url, params, data, headers)
+
+    sc.backend.handler = handler
+    res = run(sc.downloader().download_album(10))
+    assert res.ok
+    assert not any(c[1] == "https://lrclib.net/api/get" for c in sc.backend.calls)

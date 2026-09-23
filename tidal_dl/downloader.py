@@ -4,7 +4,7 @@ FLUXO DE UM ÁLBUM
 -----------------
 1. busca álbum + faixas; se já está no banco (e a pasta existe) -> pula;
 2. pasta de trabalho ``[IN PROGRESS] Nome`` (mesmo padrão do qobuz-dl-ultra);
-3. baixa capa uma vez; baixa N faixas em paralelo (``concurrency``);
+3. baixa capa uma vez; baixa as faixas em sequência (barra de progresso) ou em paralelo (``max_workers``);
 4. por faixa: resolve stream (com fallback de qualidade) -> baixa para
    ``~tmp_`` -> remux (DASH/FLAC) -> letra -> tags -> renomeia atomicamente;
 5. tudo ok  -> renomeia a pasta para o nome final, grava sentinela e banco;
@@ -25,8 +25,8 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from tidal_dl import db as dbm
-from tidal_dl import fmp4, lyrics as lyr, metadata, sentinel, ui
-from tidal_dl.lyrics_engine import LyricsEngine
+from tidal_dl import fmp4, lyrics as lyr, metadata, progress, sentinel, ui
+from tidal_dl.color import GREEN, INFO as CYAN, RED, RESET, YELLOW
 from tidal_dl.constants import (
     CHUNK_SIZE,
     MARK_INCOMPLETE,
@@ -40,9 +40,12 @@ from tidal_dl.exceptions import (
     AuthenticationError,
     DownloadError,
     NonStreamable,
+    PermanentDownloadError,
     PreviewOnly,
+    ResourceNotFoundError,
 )
-from tidal_dl.manifest import parse_m3u8_playlist, resolve_stream, resolve_video_stream
+from tidal_dl import hls
+from tidal_dl.manifest import resolve_stream, resolve_video_playback
 from tidal_dl.models import Album, Stream, Track, Video
 from tidal_dl.net import NetworkError
 from tidal_dl.settings import TidalDLSettings
@@ -155,6 +158,8 @@ class Downloader:
         self._cover_cache: dict[str, Optional[bytes]] = {}
         self._warned_tags = False
         self._warned_remux = False
+        self._parallel = False
+        self._workers = 1
 
     # ------------------------------------------------------------------
     # Rede: arquivo simples e segmentos
@@ -167,43 +172,150 @@ class Downloader:
             return None
         return resp.content if resp.status < 400 and resp.content else None
 
-    async def _stream_to(self, url: str, out, on_bytes=None) -> int:
-        """Baixa ``url`` para o arquivo aberto ``out``; devolve os bytes escritos."""
-        written = 0
-        async with self.api.http.stream(url) as r:
-            if r.status >= 400:
-                raise DownloadError(f"HTTP {r.status} ao baixar o áudio")
-            async for chunk in r.iter_chunks(CHUNK_SIZE):
-                out.write(chunk)
-                written += len(chunk)
-                if on_bytes:
-                    on_bytes(written)
-        return written
+    # ------------------------------------------------------------------
+    # Modo de execução (sequencial x paralelo)
+    # ------------------------------------------------------------------
 
-    async def _download_stream(self, stream: Stream, tmp: str) -> int:
-        """Baixa BTS (1 URL) ou DASH (init + segmentos) para ``tmp``, com retry."""
+    def _configure_mode(self, track_count: int) -> str:
+        """Define workers/paralelismo e devolve o rótulo mostrado no cabeçalho.
+
+        Mesma regra do qobuz-dl-ultra: ``--delay`` força sequencial ("Safety
+        Delay"); paralelo só faz sentido com mais de uma faixa.
+        """
+        workers = int(self.settings.max_workers)
+        self._parallel = False
+        label = "Sequencial"
+        if self.settings.delay > 0:
+            workers = 1
+            label = "Sequencial (Safety Delay ativo)"
+        elif workers > 1 and track_count > 1:
+            self._parallel = True
+            label = f"Paralelo ({workers} workers)"
+        else:
+            workers = 1
+        self._workers = workers
+        return label
+
+    # ------------------------------------------------------------------
+    # Rede: BTS (arquivo único, com resume por Range) e DASH (segmentos)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _hdr(headers: dict, name: str) -> str:
+        lname = name.lower()
+        for k, v in (headers or {}).items():
+            if k.lower() == lname:
+                return str(v)
+        return ""
+
+    async def _bts_attempt(self, url: str, tmp: str, state: dict, name: str, bar_on: bool) -> None:
+        """Uma tentativa de baixar o arquivo único, retomando de ``state['bytes']``."""
+        headers = {"Range": f"bytes={state['bytes']}-"} if state["bytes"] else None
+        async with self.api.http.stream(url, headers=headers) as r:
+            if r.status in (401, 403, 404, 451):
+                raise PermanentDownloadError(f"HTTP {r.status}: áudio indisponível (região, direitos ou sessão)")
+            if r.status == 416:
+                total = state.get("total", 0)
+                if state["bytes"] and state["bytes"] == total:
+                    return
+                state["bytes"] = 0
+                raise DownloadError("HTTP 416 antes de o arquivo local estar completo")
+            if r.status not in (200, 206):
+                raise DownloadError(f"HTTP {r.status} ao baixar o áudio")
+
+            mode = "wb"
+            if state["bytes"] and r.status == 206:
+                m = self._hdr(r.headers, "content-range")
+                start = m.split()[-1].split("-")[0] if m.lower().startswith("bytes ") else ""
+                if start.isdigit() and int(start) == state["bytes"]:
+                    mode = "ab"
+                else:
+                    state["bytes"] = 0  # Content-Range incompatível: recomeça
+            else:
+                state["bytes"] = 0  # servidor ignorou o Range (200): recomeça do zero
+
+            length = int(self._hdr(r.headers, "content-length") or 0)
+            total = state["bytes"] + length if length else 0
+            state["total"] = total
+            if self._parallel and not state.get("announced"):
+                size = f" [{total / (1024 * 1024):.1f} MB]" if total else ""
+                ui.step(f"Em Progresso: {name}{size}")
+                state["announced"] = True
+
+            with progress.track_bar(total, "  ⬇️", enabled=bar_on, initial=state["bytes"]) as bar:
+                with open(tmp, mode) as out:
+                    async for chunk in r.iter_chunks(CHUNK_SIZE):
+                        if progress.abort_event.is_set():
+                            raise KeyboardInterrupt
+                        out.write(chunk)
+                        state["bytes"] += len(chunk)
+                        bar.update(len(chunk))
+        if total and state["bytes"] < total:
+            raise DownloadError("download incompleto")
+
+    async def _fetch_segment(self, url: str) -> bytes:
+        buf = bytearray()
+        async with self.api.http.stream(url) as r:
+            if r.status in (401, 403, 404, 451):
+                raise PermanentDownloadError(f"HTTP {r.status} em segmento DASH")
+            if r.status >= 400:
+                raise DownloadError(f"HTTP {r.status} em segmento DASH")
+            async for chunk in r.iter_chunks(CHUNK_SIZE):
+                buf += chunk
+        if not buf:
+            raise DownloadError("segmento DASH vazio")
+        return bytes(buf)
+
+    async def _dash_attempt(self, urls: list, tmp: str, state: dict, name: str, bar_on: bool) -> None:
+        """Baixa os segmentos que faltam; cada segmento só é gravado inteiro (resume limpo)."""
+        done = state["seg"]
+        if self._parallel and not state.get("announced"):
+            ui.step(f"Em Progresso: {name} [{len(urls)} segmentos]")
+            state["announced"] = True
+        with progress.track_bar(len(urls), "  ↪️", unit="seg", enabled=bar_on, initial=done) as bar:
+            with open(tmp, "ab" if done else "wb") as out:
+                for i in range(done, len(urls)):
+                    if progress.abort_event.is_set():
+                        raise KeyboardInterrupt
+                    data = await self._fetch_segment(urls[i])
+                    out.write(data)
+                    state["seg"] = i + 1
+                    state["bytes"] += len(data)
+                    bar.update(1)
+                    bar.set_postfix_str(human_size(state["bytes"]))
+
+    async def _download_stream(self, stream: Stream, tmp: str, name: str) -> int:
+        """Baixa o stream para ``tmp`` com retry/backoff e retomada entre tentativas."""
         attempts = self.settings.retries
+        bar_on = self.settings.progress_bar and not self._parallel
+        state: dict = {"bytes": 0, "seg": 0}
+        if not self._parallel:
+            ui.step(f"Em Progresso: {name}")
 
         def warn_retry(n: int, exc: BaseException) -> None:
-            ui.warn(f"  Nova tentativa {n}/{attempts - 1}: {exc}")
+            ui.warn(f"Falha de Rede. Tentativa {n + 1}/{attempts} para {name} ({exc})")
 
-        async def once() -> int:
-            total = 0
-            with open(tmp, "wb") as out:
-                for url in stream.urls:
-                    total += await self._stream_to(url, out)
-            if total == 0:
-                raise DownloadError("download vazio")
-            return total
+        async def once() -> None:
+            if progress.abort_event.is_set():
+                raise KeyboardInterrupt
+            if stream.is_dash:
+                await self._dash_attempt(stream.urls, tmp, state, name, bar_on)
+            else:
+                await self._bts_attempt(stream.urls[0], tmp, state, name, bar_on)
 
-        return await retry_async(
+        await retry_async(
             once,
             attempts=attempts,
-            base_delay=1.0,
+            base_delay=2.0,
+            max_delay=32.0,
             retry_on=(NetworkError, DownloadError, OSError),
+            give_up_on=(asyncio.CancelledError, KeyboardInterrupt, PermanentDownloadError),
             sleep=self._sleep,
             on_retry=warn_retry,
         )
+        if state["bytes"] == 0:
+            raise DownloadError("download vazio")
+        return state["bytes"]
 
     # ------------------------------------------------------------------
     # Remux
@@ -328,7 +440,7 @@ class Downloader:
 
         found = self._existing(folder, base)
         if found:
-            ui.skip(f"{label} já existe")
+            ui.skip(f"{label}: já existe")
             res.success = res.skipped = True
             res.path = found
             return res
@@ -346,7 +458,7 @@ class Downloader:
                 self.api, track.id, self.settings.quality,
                 allow_fallback=self.settings.allow_quality_fallback, on_fallback=on_fallback,
             )
-            size = await self._download_stream(stream, tmp)
+            size = await self._download_stream(stream, tmp, label)
 
             bit_depth, rate = stream.bit_depth, stream.sample_rate
             audio_path = tmp
@@ -355,6 +467,8 @@ class Downloader:
                 if self.settings.remux == "none":
                     ext = "mp4"
                 else:
+                    if not self._parallel:
+                        ui.step(" └─ Montando o arquivo FLAC final...")
                     info = await self._remux_flac(tmp, remux_tmp)
                     remove_quiet(tmp)
                     audio_path = remux_tmp
@@ -363,11 +477,20 @@ class Downloader:
             elif stream.is_dash:
                 ext = "m4a"
 
+            lyrics_plain, lrc = "", None
+            if self.settings.lyrics:
+                data = await self.api.get_lyrics(track.id)
+                if not data.get("lyrics") and not data.get("subtitles") and self.settings.lyrics_fallback:
+                    data = await lyr.fetch_lrclib_lyrics(
+                        self.api.http, track.artist_names, track.title, album.full_title
+                    )
+                lyrics_plain, lrc = lyr.plain_lyrics(data), lyr.synced_lyrics(data)
+
             final = os.path.join(folder, truncate_name(base, OK_MAX_CHARACTER_LENGTH, f".{ext}") + f".{ext}")
             if ext in ("flac", "m4a"):
                 tags = metadata.build_tags(
                     track, album, stream, total_tracks=total_tracks,
-                    total_discs=album.number_of_volumes, lyrics="",
+                    total_discs=album.number_of_volumes, lyrics=lyrics_plain,
                 )
                 try:
                     await asyncio.to_thread(
@@ -381,30 +504,19 @@ class Downloader:
                     ui.warn(f"{label}: falha ao gravar tags ({exc}); arquivo mantido")
 
             os.replace(audio_path, final)
-
-            if self.settings.lyrics or self.settings.save_lrc:
+            if lrc and self.settings.save_lrc:
                 try:
-                    data = await self.api.get_lyrics(track.id)
-                    engine = LyricsEngine(genius_token=self.settings.genius_token, settings=self.settings)
-                    await asyncio.to_thread(
-                        engine.fetch_and_inject,
-                        final,
-                        track.artist_names,
-                        track.full_title,
-                        album.full_title,
-                        save_lrc=self.settings.save_lrc,
-                        embed_lyrics=self.settings.lyrics,
-                        tidal_lyrics_resp=data,
-                    )
-                except Exception as exc:
-                    logger.debug("Falha na busca/injeção de letra para %s: %s", track.id, exc)
+                    with open(os.path.splitext(final)[0] + ".lrc", "w", encoding="utf-8") as fh:
+                        fh.write(lrc)
+                except OSError:
+                    pass
 
             res.success = True
             res.path = final
             res.quality = stream.quality
             res.file_format = "FLAC" if ext == "flac" else "AAC"
             res.bit_depth, res.sample_rate = bit_depth, rate
-            ui.ok(f"{label} ({human_size(size)}, {res.file_format} {stream.quality})")
+            ui.ok(f" └─ Concluído: {label} ({human_size(size)}, {res.file_format} {stream.quality})")
         except FATAL:
             raise
         except asyncio.CancelledError:
@@ -452,6 +564,25 @@ class Downloader:
     # Álbum
     # ------------------------------------------------------------------
 
+    def _print_summary(self, kind: str, title: str, result: "AlbumResult") -> None:
+        """Bloco final (igual ao RESUMO DO ÁLBUM do qobuz-dl-ultra)."""
+        total = len(result.tracks)
+        skipped = sum(1 for t in result.tracks if t.skipped)
+        failed = result.failed
+        downloaded = sum(1 for t in result.tracks if t.success and not t.skipped)
+        lowered = sum(1 for t in result.tracks if t.success and not t.skipped
+                      and QUALITY_BY_NAME.get(t.quality, 9) < self.settings.quality)
+        ui.emit(f"\n{CYAN}{'-' * 44}{RESET}")
+        ui.emit(f"  📊 RESUMO DA {kind}: {title}")
+        ui.emit(f" - Baixadas com sucesso : {GREEN}{downloaded}/{total}{RESET}")
+        if skipped:
+            ui.emit(f" - Já existiam (puladas) : {YELLOW}{skipped}{RESET}")
+        if lowered:
+            ui.emit(f" - Em qualidade menor (fallback) : {YELLOW}{lowered}{RESET}")
+        if failed:
+            ui.emit(f" - Falhas : {RED}{failed}{RESET}")
+        ui.emit(f"{CYAN}{'-' * 44}{RESET}\n")
+
     async def download_album(self, album_id: Any) -> AlbumResult:
         album, tracks = await self.api.get_album_with_tracks(album_id)
         self._album_cache[album.id] = album
@@ -467,9 +598,12 @@ class Downloader:
                 return result
 
         multi = album.number_of_volumes > 1
+        fmt, depth, rate = quality_fields(album.audio_quality, self.settings.quality)
+        mode = self._configure_mode(len(tracks))
         ui.header("ÁLBUM", [
-            ("Artista", album.album_artist), ("Título", album.full_title),
+            ("Álbum", album.full_title), ("Artista", album.album_artist),
             ("Ano", album.year), ("Faixas", str(len(tracks) or album.number_of_tracks)),
+            ("Qualidade", f"{fmt} {depth}bit" if depth else fmt), ("Modo", mode),
         ])
         if not tracks:
             ui.warn("Álbum sem faixas disponíveis.")
@@ -491,9 +625,10 @@ class Downloader:
                 label=f"[{i}/{total}] {t.full_title}",
             ))
         try:
-            result.tracks = await run_limited(jobs, self.settings.concurrency)
+            with progress.sigint_guard():
+                result.tracks = await run_limited(jobs, self._workers)
         except BaseException:
-            # cancelamento/erro fatal: deixa a pasta marcada como incompleta
+            # CTRL+C/cancelamento/erro fatal: deixa a pasta marcada como incompleta
             await asyncio.to_thread(self._finish_workdir, work, final_dir, False)
             raise
 
@@ -503,6 +638,7 @@ class Downloader:
         for t in result.tracks:  # os caminhos apontavam para a pasta [IN PROGRESS]
             if t.path.startswith(work):
                 t.path = final + t.path[len(work):]
+        self._print_summary("ÁLBUM", album.full_title, result)
         if ok:
             await self._record_album(album, result, final)
         else:
@@ -550,13 +686,19 @@ class Downloader:
         folder = self.album_folder(album)
         result.folder = folder
         multi = album.number_of_volumes > 1
+        mode = self._configure_mode(1)
+        ui.header("FAIXA", [
+            ("Faixa", track.full_title), ("Artista", track.artist_names),
+            ("Álbum", album.full_title), ("Modo", mode),
+        ])
         sub = os.path.join(folder, f"CD {track.volume_number:02d}") if multi else folder
         base = self.track_basename(track, album, multi_disc=multi)
         cover = await self._cover(album)
-        tr = await self._download_one(
-            track, album, sub, base, cover=cover, total_tracks=album.number_of_tracks,
-            label=f"{track.artist_names} - {track.full_title}",
-        )
+        with progress.sigint_guard():
+            tr = await self._download_one(
+                track, album, sub, base, cover=cover, total_tracks=album.number_of_tracks,
+                label=f"{track.artist_names} - {track.full_title}",
+            )
         result.tracks = [tr]
         if tr.success and not tr.skipped and self.db_path:
             await dbm.a_mark_downloaded(
@@ -582,7 +724,8 @@ class Downloader:
         )
         folder = os.path.join(self.settings.directory, rel)
         result.folder = folder
-        ui.header("PLAYLIST", [("Título", pl.title), ("Faixas", str(len(tracks)))])
+        mode = self._configure_mode(len(tracks))
+        ui.header("PLAYLIST", [("Playlist", pl.title), ("Faixas", str(len(tracks))), ("Modo", mode)])
         os.makedirs(folder, exist_ok=True)
 
         total = len(tracks)
@@ -597,115 +740,134 @@ class Downloader:
                 label=f"[{i}/{total}] {t.artist_names} - {t.full_title}",
             )
 
-        result.tracks = await run_limited(
-            [one(i, t) for i, t in enumerate(tracks, start=1)], self.settings.concurrency
-        )
+        with progress.sigint_guard():
+            result.tracks = await run_limited(
+                [one(i, t) for i, t in enumerate(tracks, start=1)], self._workers
+            )
+        self._print_summary("PLAYLIST", pl.title, result)
         ok_paths = [os.path.relpath(t.path, folder) for t in result.tracks if t.success and t.path]
         if ok_paths:
             with open(os.path.join(folder, sanitize_component(pl.title) + ".m3u8"), "w", encoding="utf-8") as fh:
                 fh.write("#EXTM3U\n" + "\n".join(ok_paths) + "\n")
         return result
 
-    async def _ffmpeg_video_remux(self, src: str, dst: str) -> bool:
+    # ------------------------------------------------------------------
+    # Vídeo (HLS)
+    # ------------------------------------------------------------------
+
+    async def _ffmpeg_remux_generic(self, src: str, dst: str, *, extra: list[str] = ()) -> bool:
+        """Remux genérico ``-c copy`` (reaproveitado pelo vídeo: .ts -> .mp4)."""
         exe = encontrar_binario("ffmpeg")
         if not exe:
             return False
         try:
             proc = await asyncio.create_subprocess_exec(
-                exe, "-loglevel", "error", "-y", "-i", src, "-c", "copy", dst,
+                exe, "-loglevel", "error", "-y", "-i", src, "-c", "copy", *extra, dst,
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
             )
             _, err = await proc.communicate()
-            return proc.returncode == 0 and os.path.exists(dst) and os.path.getsize(dst) > 0
-        except Exception as exc:
-            logger.debug("remux de vídeo ffmpeg falhou: %s", exc)
+        except (OSError, NotImplementedError) as exc:
+            logger.debug("ffmpeg indisponível para remux de vídeo: %s", exc)
             return False
+        if proc.returncode != 0 or not os.path.exists(dst) or os.path.getsize(dst) == 0:
+            logger.debug("ffmpeg (vídeo) falhou: %s", err.decode("utf-8", "replace")[:200])
+            remove_quiet(dst)
+            return False
+        return True
 
-    async def _download_m3u8_stream(self, stream: Stream, tmp: str) -> int:
-        if not stream.urls:
-            raise DownloadError("stream m3u8 sem URLs")
-
-        initial_url = stream.urls[0]
-        raw_content = await self._fetch_bytes(initial_url)
-        if not raw_content:
-            raise DownloadError("falha ao baixar playlist m3u8")
-
-        text_content = raw_content.decode("utf-8", errors="replace")
-        ts_urls = parse_m3u8_playlist(text_content, base_url=initial_url)
-
-        if len(ts_urls) == 1 and (".m3u8" in ts_urls[0] or "m3u8" in ts_urls[0]):
-            sub_raw = await self._fetch_bytes(ts_urls[0])
-            if sub_raw:
-                ts_urls = parse_m3u8_playlist(sub_raw.decode("utf-8", errors="replace"), base_url=ts_urls[0])
-
-        if not ts_urls:
-            raise DownloadError("nenhum segmento encontrado na playlist m3u8")
-
-        total = 0
-        with open(tmp, "wb") as out:
-            for url in ts_urls:
-                seg_bytes = await self._fetch_bytes(url)
-                if seg_bytes:
-                    out.write(seg_bytes)
-                    total += len(seg_bytes)
-        if total == 0:
-            raise DownloadError("download m3u8 vazio")
-        return total
+    def video_filename(self, video: Video) -> str:
+        year = f" ({video.year})" if video.release_date else ""
+        return sanitize_component(f"{video.artist_names} - {video.full_title}{year}")
 
     async def download_video(self, video_id: Any) -> AlbumResult:
-        video = await self.api.get_video(video_id)
+        """Baixa um vídeo musical do Tidal (HLS: ``.ts`` cru, ou ``.mp4`` com ffmpeg/fMP4).
+
+        Sem resumo entre execuções (ao contrário do áudio): uma interrupção faz
+        a próxima tentativa recomeçar o vídeo do zero. Cada segmento individual
+        tem retry. Segmentos criptografados (AES-128, padrão do HLS) exigem o
+        pacote opcional ``cryptography``.
+        """
+        try:
+            video = await self.api.get_video(video_id)
+        except ResourceNotFoundError:
+            raise
         result = AlbumResult(video.id, video.full_title, video.artist_names)
-        ui.step(f"Vídeo: {video.artist_names} - {video.full_title}")
-
-        video_dir = os.path.expanduser(self.settings.video_directory or "TidalVideos")
+        video_dir = self.settings.video_directory
         os.makedirs(video_dir, exist_ok=True)
-
-        safe_name = sanitize_component(f"{video.artist_names} - {video.full_title}")
-        final_path = os.path.join(video_dir, f"{safe_name}.mp4")
         result.folder = video_dir
 
-        if os.path.exists(final_path) and os.path.getsize(final_path) > 0:
-            ui.skip(f"Vídeo já existe: {final_path}")
-            result.skipped = True
-            result.tracks = [TrackResult(video.id, video.full_title, success=True, skipped=True, path=final_path)]
-            return result
+        mode = self._configure_mode(1)
+        ui.header("VÍDEO", [
+            ("Vídeo", video.full_title), ("Artista", video.artist_names),
+            ("Ano", video.year or "?"), ("Qualidade", self.settings.video_quality), ("Modo", mode),
+        ])
 
+        base = self.video_filename(video)
+        if self.db_path:
+            saved = await dbm.a_is_downloaded(self.db_path, video.id, "video")
+            if saved and os.path.isfile(saved):
+                ui.skip(f"{video.artist_names} - {video.full_title}: já existe")
+                result.skipped = True
+                result.tracks = [TrackResult(video.id, video.full_title, success=True, skipped=True, path=saved)]
+                return result
+
+        tr = TrackResult(video.id, video.full_title)
+        tmp = os.path.join(video_dir, f"{TMP_PREFIX}{video.id}.video")
+        label = f"{video.artist_names} - {video.full_title}"
         try:
-            stream = await resolve_video_stream(self.api, video.id, quality=self.settings.video_quality)
-        except Exception as exc:
-            ui.error(f"Falha ao obter stream do vídeo {video.full_title}: {exc}")
-            result.tracks = [TrackResult(video.id, video.full_title, success=False, error=str(exc))]
-            return result
+            if not video.available:
+                raise NonStreamable("vídeo indisponível na sua região/conta")
+            top_url = await resolve_video_playback(self.api, video.id, self.settings.video_quality)
 
-        tmp_path = os.path.join(video_dir, f"~tmp_{video.id}.mp4")
-        try:
-            if stream.is_m3u8:
-                await self._download_m3u8_stream(stream, tmp_path)
+            ui.step(f"Em Progresso: {label}")
+
+            def warn_retry(n: int, exc: BaseException) -> None:
+                ui.warn(f"Falha de Rede. Tentativa {n + 1}/{self.settings.retries} para {label} ({exc})")
+
+            with progress.track_bar(0, "  ↪️", unit="seg", enabled=self.settings.progress_bar) as bar:
+                stats = await hls.download_hls(
+                    self.api.http, top_url, tmp,
+                    quality=self.settings.video_quality, retries=self.settings.retries,
+                    sleep=self._sleep, bar=bar, on_retry=warn_retry,
+                    abort_check=progress.abort_event.is_set,
+                )
+
+            ext = "mp4" if stats["fragmented"] else "ts"
+            final = os.path.join(video_dir, f"{base}.{ext}")
+            if not stats["fragmented"] and self.settings.remux != "none":
+                remuxed = os.path.join(video_dir, f"{TMP_PREFIX}remux_{video.id}.mp4")
+                if await self._ffmpeg_remux_generic(tmp, remuxed):
+                    os.replace(remuxed, os.path.join(video_dir, f"{base}.mp4"))
+                    remove_quiet(tmp)
+                    final = os.path.join(video_dir, f"{base}.mp4")
+                else:
+                    os.replace(tmp, final)
             else:
-                await self._download_stream(stream, tmp_path)
+                os.replace(tmp, final)
 
-            remuxed_path = os.path.join(video_dir, f"~remux_{video.id}.mp4")
-            if await self._ffmpeg_video_remux(tmp_path, remuxed_path):
-                os.replace(remuxed_path, final_path)
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            else:
-                os.replace(tmp_path, final_path)
-
-            ui.ok(f"  [VÍDEO] {video.artist_names} - {video.full_title} -> {final_path}")
-            tr = TrackResult(video.id, video.full_title, success=True, path=final_path, quality="VIDEO", file_format="MP4")
-            result.tracks = [tr]
+            tr.success = True
+            tr.path = final
+            tr.quality = self.settings.video_quality
+            tr.file_format = "MP4" if final.endswith(".mp4") else "TS"
+            ui.ok(f" └─ Concluído: {label} ({human_size(stats['bytes'])}, {tr.file_format})")
             if self.db_path:
                 await dbm.a_mark_downloaded(
-                    self.db_path, video.id, "video",
-                    quality=0, saved_path=final_path, file_format="MP4",
-                    artist=video.artist_names, album="", title=video.full_title,
+                    self.db_path, video.id, "video", quality=0, saved_path=final,
+                    file_format=tr.file_format, artist=video.artist_names, title=video.full_title,
                     release_date=video.release_date,
                 )
-            return result
+        except FATAL:
+            remove_quiet(tmp)
+            raise
+        except asyncio.CancelledError:
+            remove_quiet(tmp)
+            raise
         except Exception as exc:
-            ui.error(f"Erro ao baixar vídeo {video.full_title}: {exc}")
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-            result.tracks = [TrackResult(video.id, video.full_title, success=False, error=str(exc))]
-            return result
+            tr.error = str(exc) or type(exc).__name__
+            ui.error(f"{label}: {tr.error}")
+            logger.debug("falha ao baixar vídeo %s", video.id, exc_info=True)
+            remove_quiet(tmp)
+        result.tracks = [tr]
+        self._print_summary("VÍDEO", video.full_title, result)
+        return result
+

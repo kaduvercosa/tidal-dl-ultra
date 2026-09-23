@@ -190,6 +190,8 @@ class Track:
 
 @dataclass
 class Video:
+    """Vídeo musical do Tidal (endpoint ``videos/{id}``)."""
+
     id: int
     title: str
     version: str = ""
@@ -197,11 +199,10 @@ class Video:
     artists: list[Artist] = field(default_factory=list)
     duration: int = 0
     explicit: bool = False
-    image_url: Optional[str] = None
     release_date: str = ""
+    quality: str = ""  # "HIGH" | "MEDIUM" | "LOW" (o que a API devolveu como audioQuality/max)
     stream_ready: bool = True
     allow_streaming: bool = True
-    url: str = ""
 
     @classmethod
     def from_dict(cls, d: dict) -> "Video":
@@ -214,11 +215,10 @@ class Video:
             artists=[Artist.from_dict(a) for a in (d.get("artists") or [])],
             duration=_int(d.get("duration")),
             explicit=bool(d.get("explicit")),
-            image_url=d.get("imageId") or d.get("image"),
             release_date=str(d.get("releaseDate") or d.get("streamStartDate") or "")[:10],
+            quality=str(d.get("quality") or "").upper(),
             stream_ready=d.get("streamReady", True) is not False,
             allow_streaming=d.get("allowStreaming", True) is not False,
-            url=str(d.get("url") or ""),
         )
 
     @property
@@ -228,6 +228,14 @@ class Video:
     @property
     def artist_names(self) -> str:
         return join_artists(self.artists, self.artist.name)
+
+    @property
+    def year(self) -> str:
+        return self.release_date[:4] or "0000"
+
+    @property
+    def available(self) -> bool:
+        return self.stream_ready and self.allow_streaming
 
 
 @dataclass
@@ -286,7 +294,6 @@ class Stream:
     codec: str  # "flac", "aac", "mp4a.40.2"...
     urls: list[str]  # BTS: 1 URL. DASH: [init, seg1, seg2, ...]
     is_dash: bool = False
-    is_m3u8: bool = False
     bit_depth: Optional[int] = None
     sample_rate: Optional[int] = None
     replay_gain: Optional[float] = None
@@ -300,6 +307,4 @@ class Stream:
 
     @property
     def extension(self) -> str:
-        if self.is_m3u8:
-            return "mp4"
         return "flac" if self.is_flac else "m4a"

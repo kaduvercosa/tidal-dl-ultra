@@ -74,7 +74,24 @@ def test_album_inexistente_devolve_false(tmp_path):
 def test_tipo_desconhecido(tmp_path):
     sc, t = make(tmp_path)
     with pytest.raises(TidalDLException):
-        run(t.download_from_id(1, "xyz"))
+        run(t.download_from_id(1, "mix"))
+
+
+def test_video_via_url_chama_download_video(tmp_path, monkeypatch):
+    sc, t = make(tmp_path)
+    vistos = []
+
+    async def fake_download_video(video_id):
+        vistos.append(video_id)
+        from tidal_dl.downloader import AlbumResult, TrackResult
+
+        r = AlbumResult(video_id, "V", "A")
+        r.tracks = [TrackResult(video_id, "V", success=True)]
+        return r
+
+    monkeypatch.setattr(t.downloader, "download_video", fake_download_video)
+    assert run(t.handle_url("https://tidal.com/browse/video/555")) is True
+    assert vistos == ["555"]
 
 
 def test_faixa_e_playlist_e_artista(tmp_path):

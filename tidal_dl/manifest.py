@@ -3,8 +3,7 @@
 Dois formatos chegam de ``playbackinfopostpaywall``:
 
   * ``application/vnd.tidal.bts``  -> JSON em base64, com UMA URL (arquivo inteiro);
-  * ``application/dash+xml``       -> MPD em base64, com init + N segmentos;
-  * ``application/vnd.tidal.emu`` / ``x-mpegURL`` -> M3U8 para vídeos.
+  * ``application/dash+xml``       -> MPD em base64, com init + N segmentos.
 
 POLÍTICA DE PROTEÇÃO
 --------------------
@@ -23,7 +22,6 @@ import json
 import logging
 import xml.etree.ElementTree as ET
 from typing import Any, Optional
-from urllib.parse import urljoin
 
 from tidal_dl.constants import QUALITY_MAP
 from tidal_dl.exceptions import (
@@ -87,30 +85,6 @@ def parse_dash(xml_text: str) -> tuple[str, list[str]]:
     return codec, [init] + [media.replace("$Number$", str(start + i)) for i in range(count)]
 
 
-def parse_m3u8_playlist(content: str, base_url: str = "") -> list[str]:
-    """Parse M3U8 content for segment URLs or master playlist variants."""
-    lines = [line.strip() for line in content.splitlines() if line.strip()]
-
-    # If it's a master playlist, select highest quality variant
-    if any("#EXT-X-STREAM-INF" in line for line in lines):
-        selected_url = None
-        for i, line in enumerate(lines):
-            if "#EXT-X-STREAM-INF" in line and i + 1 < len(lines):
-                selected_url = lines[i + 1]
-        if selected_url:
-            if not selected_url.startswith("http"):
-                selected_url = urljoin(base_url, selected_url)
-            return [selected_url]
-
-    # Media playlist: extract segments
-    urls = []
-    for line in lines:
-        if not line.startswith("#"):
-            url = line if line.startswith("http") else urljoin(base_url, line)
-            urls.append(url)
-    return urls
-
-
 def _decode_b64(text: str) -> bytes:
     try:
         return base64.b64decode(text)
@@ -157,44 +131,6 @@ def stream_from_playback(info: dict, track_id: int) -> Stream:
     return Stream(codec=str(manifest.get("codecs") or ""), urls=list(urls), is_dash=False, **common)
 
 
-def video_stream_from_playback(info: dict, video_id: int) -> Stream:
-    """Converte a resposta de video playbackinfo em ``Stream``."""
-    if str(info.get("assetPresentation") or "FULL").upper() != "FULL":
-        raise PreviewOnly("Apenas prévia (PREVIEW) disponível para este vídeo.")
-    mime = str(info.get("manifestMimeType") or "").lower()
-    raw = _decode_b64(info.get("manifest") or "")
-
-    if "dash" in mime:
-        if _is_protected(info.get("encryptionType")):
-            raise UnsupportedProtection(f"stream DASH de vídeo protegido ({info.get('encryptionType')})")
-        codec, urls = parse_dash(raw.decode("utf-8", errors="replace"))
-        return Stream(track_id=video_id, quality="VIDEO", codec=codec, urls=urls, is_dash=True)
-
-    if "json" in mime or "bts" in mime or "emu" in mime:
-        try:
-            manifest = json.loads(raw.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError) as exc:
-            raise NonStreamable(f"manifest de vídeo ilegível: {exc}") from exc
-        urls = manifest.get("urls") or []
-        if not urls:
-            restrictions = manifest.get("restrictions") or []
-            code = restrictions[0].get("code") if restrictions and isinstance(restrictions[0], dict) else None
-            raise NonStreamable(f"sem URL no manifesto de vídeo ({code or 'restrito'})")
-        if _is_protected(manifest.get("encryptionType")):
-            raise UnsupportedProtection(f"stream de vídeo protegido ({manifest.get('encryptionType')})")
-        is_m3u = any(".m3u" in u for u in urls)
-        return Stream(track_id=video_id, quality="VIDEO", codec=str(manifest.get("codecs") or "h264"), urls=list(urls), is_dash=False, is_m3u8=is_m3u)
-
-    if "m3u8" in mime or "x-mpegurl" in mime:
-        url_text = raw.decode("utf-8", errors="replace").strip()
-        urls = [line.strip() for line in url_text.splitlines() if line.strip() and not line.startswith("#")]
-        if not urls:
-            urls = [url_text]
-        return Stream(track_id=video_id, quality="VIDEO", codec="h264", urls=urls, is_m3u8=True)
-
-    raise NonStreamable(f"tipo de manifesto de vídeo não suportado: {mime}")
-
-
 def _f(v: Any) -> Optional[float]:
     try:
         return float(v)
@@ -210,7 +146,11 @@ async def resolve_stream(
     allow_fallback: bool = True,
     on_fallback: Any = None,
 ) -> Stream:
-    """Pede o stream no tier ``quality`` e, se preciso, desce até um que sirva."""
+    """Pede o stream no tier ``quality`` e, se preciso, desce até um que sirva.
+
+    Desce em: sem permissão (403), não-streamable, protegido. NÃO desce em
+    erro de rede/autenticação/rate limit (esses propagam).
+    """
     if quality not in QUALITY_MAP:
         raise InvalidQuality(f"qualidade inválida: {quality} (use 0-4)")
     last: Optional[Exception] = None
@@ -220,7 +160,7 @@ async def resolve_stream(
             info = await api.playback_info(track_id, name)
             return stream_from_playback(info, track_id)
         except PreviewOnly:
-            raise
+            raise  # descer de qualidade não resolve prévia
         except (ForbiddenError, NonStreamable) as exc:
             last = exc
             logger.debug("faixa %s indisponível em %s: %s", track_id, name, exc)
@@ -234,7 +174,22 @@ async def resolve_stream(
     raise last
 
 
-async def resolve_video_stream(api: Any, video_id: int, quality: str = "HIGH") -> Stream:
-    """Obtém o stream de vídeo do Tidal."""
+async def resolve_video_playback(api: Any, video_id: int, quality: str = "HIGH") -> str:
+    """Pede o playback info do vídeo e devolve a URL do manifesto HLS (top-level).
+
+    O manifesto (``manifestMimeType`` ``application/vnd.tidal.emu``) é, como no
+    áudio BTS, um JSON em base64 com ``{"urls": [...]}`` -- só que a URL aqui é
+    de um ``.m3u8`` (master ou media playlist), não de um arquivo de áudio.
+    """
     info = await api.video_playback_info(video_id, quality)
-    return video_stream_from_playback(info, video_id)
+    if str(info.get("assetPresentation") or "FULL").upper() != "FULL":
+        raise PreviewOnly("Apenas prévia (PREVIEW) disponível para este vídeo.")
+    raw = _decode_b64(info.get("manifest") or "")
+    try:
+        manifest = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise NonStreamable(f"manifesto de vídeo ilegível: {exc}") from exc
+    urls = manifest.get("urls") or []
+    if not urls:
+        raise NonStreamable("sem URL no manifesto de vídeo")
+    return urls[0]
