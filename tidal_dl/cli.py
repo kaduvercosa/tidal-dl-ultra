@@ -230,8 +230,6 @@ async def run_online(command: str, args, settings: TidalDLSettings, paths: dict)
             return await cmd_user(tidal)
         if command == "dl":
             summary = await tidal.download_urls(_expand_sources(args.SOURCE), include_eps=args.eps)
-            ui.blank()
-            ui.info(f"Concluído: {summary['ok']} ok, {summary['failed']} com falha.")
             return 1 if summary["failed"] else 0
         if command in ("search", "fun", "i"):
             ok = await tidal.interactive(" ".join(args.QUERY), args.type)

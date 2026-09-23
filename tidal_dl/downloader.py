@@ -479,12 +479,19 @@ class Downloader:
 
             lyrics_plain, lrc = "", None
             if self.settings.lyrics:
+                lyric_source = "Tidal"
                 data = await self.api.get_lyrics(track.id)
                 if not data.get("lyrics") and not data.get("subtitles") and self.settings.lyrics_fallback:
                     data = await lyr.fetch_lrclib_lyrics(
                         self.api.http, track.artist_names, track.title, album.full_title
                     )
+                    lyric_source = "LRCLIB"
                 lyrics_plain, lrc = lyr.plain_lyrics(data), lyr.synced_lyrics(data)
+                if lyrics_plain or lrc:
+                    lyric_kind = "LRC sincronizada" if lrc else "letra"
+                    ui.detail(f"Letra obtida ({lyric_source}; {lyric_kind})", indent=6)
+                else:
+                    ui.detail("Letra não encontrada", indent=6)
 
             final = os.path.join(folder, truncate_name(base, OK_MAX_CHARACTER_LENGTH, f".{ext}") + f".{ext}")
             if ext in ("flac", "m4a"):
@@ -824,7 +831,7 @@ class Downloader:
             def warn_retry(n: int, exc: BaseException) -> None:
                 ui.warn(f"Falha de Rede. Tentativa {n + 1}/{self.settings.retries} para {label} ({exc})")
 
-            with progress.track_bar(0, "  ↪️", unit="seg", enabled=self.settings.progress_bar) as bar:
+            with progress.track_bar(0, "  ↪️", unit="B", enabled=self.settings.progress_bar) as bar:
                 stats = await hls.download_hls(
                     self.api.http, top_url, tmp,
                     quality=self.settings.video_quality, retries=self.settings.retries,

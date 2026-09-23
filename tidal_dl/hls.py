@@ -315,7 +315,7 @@ async def download_hls(
             out.write(data)
             total_bytes += len(data)
             if bar is not None:
-                bar.update(1)
+                bar.update(len(data))
 
     if total_bytes == 0:
         raise DownloadError("download de vídeo vazio")
