@@ -1,0 +1,31 @@
+name: Ruff Auto-Fix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  autofix:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install Ruff
+        run: pip install ruff
+
+      - name: Run Ruff Fix
+        run: |
+          ruff check . --fix
+          ruff format .
+
+      - name: Commit fixes
+        uses: stefanzweifel/git-auto-commit-action@v7
+        with:
+          commit_message: "style: correções automáticas do Ruff"
