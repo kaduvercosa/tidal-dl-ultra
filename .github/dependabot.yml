@@ -1,0 +1,56 @@
+# Mantém automaticamente atualizadas as versões das GitHub Actions
+# usadas em pypi.yml, tests.yml, ruff.yml, ruff-autofix.yml e docker.yml
+# (actions/checkout, actions/setup-python, docker/login-action,
+# docker/metadata-action, docker/build-push-action,
+# pypa/gh-action-pypi-publish, etc.)
+#
+# O Dependabot varre todos os arquivos dentro de .github/workflows/
+# automaticamente quando o ecossistema é "github-actions" -- não
+# precisa listar cada workflow manualmente.
+
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"   # troque para "daily" se quiser checagem diária
+      day: "monday"
+      time: "06:00"
+      timezone: "America/Recife"
+    groups:
+      # Agrupa todas as atualizações em um único PR por semana,
+      # em vez de um PR separado para cada action.
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    open-pull-requests-limit: 10
+
+  # Dependências Python declaradas em pyproject.toml (a fonte de verdade
+  # única -- ver tests/regression/test_dependencias.py e
+  # tools/gerar_requirements.py, que mantém requirements.txt em sincronia
+  # com ele). Sem este bloco, o Dependabot cuidava só das GitHub Actions e
+  # deixava httpx/mutagen/cryptography/etc. sem nenhuma checagem
+  # automática de atualização -- justamente as dependências que mais
+  # importam pra segurança (ex.: CVE em alguma lib de rede/criptografia).
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "America/Recife"
+    groups:
+      python-dependencies:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "deps"
+    labels:
+      - "dependencies"
+      - "python"
+    open-pull-requests-limit: 10
