@@ -56,6 +56,8 @@ def test_stream_bts_ok_e_aac():
     assert not s.is_dash and s.urls == ["http://a/1.flac"]
     aac = m.stream_from_playback(bts(codecs="mp4a.40.2"), 5)
     assert aac.extension == "m4a" and not aac.is_flac
+    atmos = m.stream_from_playback(bts(codecs="ec-3"), 5)
+    assert atmos.extension == "m4a" and not atmos.is_flac
 
 
 @pytest.mark.parametrize("info", [dash(enc="AES"), bts(enc="OLD_AES")])
@@ -99,6 +101,36 @@ def test_resolve_desce_de_qualidade_em_403_e_protegido():
     s = run(m.resolve_stream(api, 1, 4, on_fallback=lambda a, b, e: fallbacks.append((a, b))))
     assert api.asked == ["HI_RES_LOSSLESS", "HI_RES", "LOSSLESS"] and s.quality == "LOSSLESS"
     assert fallbacks == [("HI_RES_LOSSLESS", "HI_RES"), ("HI_RES", "LOSSLESS")]
+
+
+def test_resolve_prioriza_atmos_e_rejeita_codec_estereo():
+    atmos = bts(codecs="ec-3")
+    atmos["audioQuality"] = "DOLBY_ATMOS"
+    api = FakeAPI({"DOLBY_ATMOS": atmos})
+    stream = run(m.resolve_stream(api, 1, 4, preferred_tier="DOLBY_ATMOS"))
+    assert api.asked == ["DOLBY_ATMOS"] and stream.codec == "ec-3"
+
+
+def test_resolve_atmos_estereo_faz_fallback_pcm():
+    """Uma resposta estéreo à tentativa Atmos não pode ser aceita como Atmos."""
+    stereo = bts(codecs="flac")
+    stereo["audioQuality"] = "LOSSLESS"
+    pcm = dash(quality="HI_RES_LOSSLESS")
+    pcm["audioMode"] = "STEREO"
+    api = FakeAPI({"DOLBY_ATMOS": stereo, "HI_RES_LOSSLESS": pcm})
+
+    stream = run(m.resolve_stream(api, 1, 4, preferred_tier="DOLBY_ATMOS"))
+
+    assert api.asked == ["DOLBY_ATMOS", "HI_RES_LOSSLESS"]
+    assert stream.quality == "HI_RES_LOSSLESS"
+    assert stream.audio_mode != "DOLBY_ATMOS"
+
+
+def test_resolve_atmos_indisponivel_sem_fallback_gera_erro():
+    api = FakeAPI({"DOLBY_ATMOS": ForbiddenError("Atmos indisponível")})
+    with pytest.raises(ForbiddenError):
+        run(m.resolve_stream(api, 1, 4, preferred_tier="DOLBY_ATMOS", allow_fallback=False))
+    assert api.asked == ["DOLBY_ATMOS"]
 
 
 def test_resolve_sem_fallback_falha_na_primeira():

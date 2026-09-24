@@ -319,10 +319,13 @@ def ok(message):
     _emit_tagged(SUCCESS, "+", message)
 
 
-def step(message):
+def step(message, plain=False):
     # Mensagem de etapa em andamento -- prefixo "[*]" na cor de destaque.
+    # plain=True usa a cor padrão do terminal (sem destaque), pra mensagens
+    # que não devem competir visualmente com as etapas coloridas (ex.: busca
+    # de letras, que já tem seu próprio resultado colorido em ok()/warn()).
     """Print a progress step message (arrow icon)."""
-    _emit_tagged(HIGHLIGHT, "*", message)
+    _emit_tagged(RESET if plain else HIGHLIGHT, "*", message)
 
 
 def info(message):

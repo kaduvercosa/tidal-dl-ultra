@@ -7,7 +7,7 @@ import pytest
 
 from scenario import Scenario
 from tidal_dl import db, sentinel
-from tidal_dl.downloader import effective_quality, quality_fields, run_limited
+from tidal_dl.downloader import dolby_file_format, effective_quality, quality_fields, run_limited
 from tidal_dl.exceptions import AuthenticationError
 from tidal_dl.models import Album, Artist
 
@@ -28,16 +28,34 @@ def test_quality_fields():
     assert quality_fields("HI_RES_LOSSLESS", 2) == ("FLAC", 16, "44.1")
     assert quality_fields("HI_RES_LOSSLESS", 1) == ("AAC", 16, "44.1")
     assert quality_fields("LOSSLESS", 4) == ("FLAC", 16, "44.1")  # álbum limita o pedido
+    assert quality_fields("DOLBY_ATMOS", 4) == ("ATMOS", None, "")
+    assert quality_fields("HIGH", 4, ["DOLBY_ATMOS"]) == ("ATMOS", None, "")
     assert quality_fields("", 3)[0] == "FLAC"
+    assert dolby_file_format("ec-3") == "EAC3"
+    assert dolby_file_format("ac-4") == "AC4"
 
 
 def test_album_usa_o_maximo_publicado_sem_fallback_artificial(tmp_path):
     sc = Scenario(tmp_path, quality="LOSSLESS")
     res = run(sc.downloader().download_album(10))
     assert res.ok
-    assert effective_quality(Album(10, "Alb", artist=Artist(), audio_quality="LOSSLESS"), 4) == 2
-    assert all(tier == "LOSSLESS" for _tid, tier in sc.asked)
+    assert effective_quality(Album(10, "Alb", artist=Artist(), audio_quality="LOSSLESS"), 4) == 4
+    assert all(
+        [tier for _tid, tier in sc.asked][index:index + 3]
+        == ["HI_RES_LOSSLESS", "HI_RES", "LOSSLESS"]
+        for index in range(0, len(sc.asked), 3)
+    )
     assert res.folder.endswith("[FLAC 16]")
+
+
+def test_album_atmos_nao_usa_nome_de_qualidade_pcm(tmp_path):
+    sc = Scenario(tmp_path, tracks=1, quality="DOLBY_ATMOS")
+    dl = sc.downloader()
+    res = run(sc.downloader().download_album(10))
+    assert res.ok
+    assert " [ATMOS" in dl.album_folder(Album(10, "Alb", artist=Artist(name="Art"),
+                                             audio_quality="DOLBY_ATMOS"))
+    assert (1, "DOLBY_ATMOS") in sc.asked
 
 
 def test_resumo_explicita_limite_do_catalogo_e_indice(tmp_path, capsys):
@@ -46,7 +64,23 @@ def test_resumo_explicita_limite_do_catalogo_e_indice(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "limite informado pelo catálogo" in out.lower()
     assert "[faixa 01/02] Song1" in out
-    assert "catálogo informou" in out
+    assert "Diagnóstico de qualidade:" in out
+    assert "2 faixa(s): limite informado pelo catálogo confirmado pelo playback" in out
+    assert out.count("resposta da API:") == 1
+    assert "Qualidade entregue: 16bit/44.1kHz (2 faixa(s))" in out
+
+
+def test_tags_sao_gravadas_no_arquivo_final_e_nao_no_temporario(tmp_path, monkeypatch):
+    sc = Scenario(tmp_path, tracks=1, quality="LOSSLESS", lyrics=False)
+    tagged = []
+
+    def fake_tag_file(path, tags, cover=None):
+        tagged.append(path)
+
+    monkeypatch.setattr("tidal_dl.metadata.tag_file", fake_tag_file)
+    res = run(sc.downloader().download_album(10))
+    assert res.ok and tagged
+    assert tagged[0].endswith(".flac") and not tagged[0].endswith(".part")
 
 
 def test_video_de_album_tem_raiz_separada_mesmo_com_configuracao_antiga(tmp_path):
@@ -412,8 +446,6 @@ def test_fallback_lrclib_quando_tidal_nao_tem_letra(tmp_path):
     sc.backend.handler = handler
     res = run(sc.downloader().download_album(10))
     assert res.ok
-    lrc_or_txt = res.tracks[0].path.rsplit(".", 1)[0]
-    from tidal_dl import metadata as _md  # só para import válido no bloco
     # confere que a letra de fallback foi de fato usada nas tags do FLAC (mutagen ausente:
     # o efeito observável aqui é indireto -- então validamos via chamada registrada)
     assert any(c[1] == "https://lrclib.net/api/get" for c in sc.backend.calls)

@@ -55,11 +55,20 @@ def build_tags(
     """
     tg = stream.replay_gain if stream.replay_gain is not None else track.replay_gain
     tp = stream.peak if stream.peak is not None else track.peak
+    
+    # Extrai o gênero do álbum de forma segura, seja string direta ou o primeiro item de uma lista
+    album_genre = None
+    if hasattr(album, "genre") and album.genre:
+        album_genre = album.genre
+    elif hasattr(album, "genres") and album.genres and isinstance(album.genres, list):
+        album_genre = album.genres[0]
+
     tags: dict[str, Any] = {
         "TITLE": track.full_title,
         "ARTIST": track.artist_names,
         "ALBUMARTIST": album.album_artist,
         "ALBUM": album.full_title,
+        "GENRE": album_genre,
         "TRACKNUMBER": track.track_number or None,
         "TRACKTOTAL": total_tracks or album.number_of_tracks or None,
         "DISCNUMBER": track.volume_number or None,
@@ -119,6 +128,8 @@ def tag_m4a(path: str, tags: dict[str, str], cover: Optional[bytes] = None) -> N
     audio["disk"] = [(int(tags.get("DISCNUMBER", 1) or 1), int(tags.get("DISCTOTAL", 1) or 1))]
     if tags.get("DATE"):
         audio["\xa9day"] = [tags["DATE"]]
+    if tags.get("GENRE"):
+        audio["\xa9gen"] = [tags["GENRE"]]
     if tags.get("COPYRIGHT"):
         audio["cprt"] = [tags["COPYRIGHT"]]
     if tags.get("LYRICS"):
@@ -169,6 +180,17 @@ def tag_video_file(path: str, video: Video, *, album: Optional[Album] = None,
             audio["\xa9day"] = [album.release_date]
         if album.copyright:
             audio["cprt"] = [album.copyright]
+        
+        # Injeta o gênero do álbum no vídeo, caso exista
+        album_genre = None
+        if hasattr(album, "genre") and album.genre:
+            album_genre = album.genre
+        elif hasattr(album, "genres") and album.genres and isinstance(album.genres, list):
+            album_genre = album.genres[0]
+            
+        if album_genre:
+            audio["\xa9gen"] = [album_genre]
+            
     audio["----:com.apple.iTunes:TIDALVIDEOID"] = [MP4FreeForm(str(video.id).encode("utf-8"))]
     if video.explicit:
         audio["rtng"] = [1]

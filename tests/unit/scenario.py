@@ -7,6 +7,7 @@ import json
 import fakes
 from tidal_dl import auth
 from tidal_dl.api import TidalAPI
+from tidal_dl.constants import QUALITY_BY_NAME
 from tidal_dl.settings import TidalDLSettings
 
 COVER = "https://resources.tidal.com/images/aa/bb/cc/1280x1280.jpg"
@@ -66,6 +67,12 @@ class Scenario:
         if (tid, tier) in self.protected:
             return {"manifestMimeType": "application/dash+xml", "audioQuality": tier, "assetPresentation": "FULL",
                     "encryptionType": "AES", "manifest": fakes.b64(fakes.dash_mpd(f"https://cdn/{tid}", 2))}
+        maximum = QUALITY_BY_NAME.get(self.quality)
+        requested = QUALITY_BY_NAME.get(tier)
+        if maximum is not None and requested is not None and requested > maximum:
+            return {"manifestMimeType": "application/vnd.tidal.bts", "audioQuality": tier,
+                    "assetPresentation": "FULL", "encryptionType": "NONE",
+                    "manifest": fakes.b64(json.dumps({"urls": [], "codecs": "flac"}))}
         if tier == "HI_RES_LOSSLESS":
             return {"manifestMimeType": "application/dash+xml", "audioQuality": tier, "assetPresentation": "FULL",
                     "encryptionType": "NONE", "manifest": fakes.b64(fakes.dash_mpd(f"https://cdn/{tid}", 2))}

@@ -69,6 +69,15 @@ class Album:
     explicit: bool = False
     audio_quality: str = ""
     audio_modes: list[str] = field(default_factory=list)
+    # Tags de "mediaMetadata" (ex.: LOSSLESS, HIRES_LOSSLESS, DOLBY_ATMOS) --
+    # sinal DIFERENTE de audio_quality/audio_modes. audio_quality/audio_modes
+    # dizem qual e' o mix "principal"/default retornado pela API; tags dizem
+    # quais formatos de entrega EXISTEM pra esse conteudo. Um album pode ter
+    # audio_quality="HI_RES_LOSSLESS" (mix estereo e' o principal) e AINDA
+    # ASSIM ter um mix Dolby Atmos disponivel só' visivel aqui -- sem checar
+    # tags, esse album nunca tentava o tier Atmos (ver is_dolby_atmos() em
+    # downloader.py). Mesmo campo que o tiddl usa (Track.MediaMetadata.tags).
+    media_metadata_tags: list[str] = field(default_factory=list)
     type: str = "ALBUM"
     upc: str = ""
     copyright: str = ""
@@ -78,6 +87,7 @@ class Album:
     @classmethod
     def from_dict(cls, d: dict) -> "Album":
         d = d or {}
+        media_metadata = d.get("mediaMetadata") if isinstance(d.get("mediaMetadata"), dict) else {}
         return cls(
             id=_int(d.get("id")),
             title=str(d.get("title") or "Unknown"),
@@ -92,6 +102,7 @@ class Album:
             explicit=bool(d.get("explicit")),
             audio_quality=str(d.get("audioQuality") or "").upper(),
             audio_modes=[str(m).upper() for m in (d.get("audioModes") or [])],
+            media_metadata_tags=[str(t).upper() for t in (media_metadata.get("tags") or [])],
             type=str(d.get("type") or "ALBUM").upper(),
             upc=str(d.get("upc") or ""),
             copyright=str(d.get("copyright") or ""),
@@ -138,6 +149,8 @@ class Track:
     isrc: str = ""
     audio_quality: str = ""
     audio_modes: list[str] = field(default_factory=list)
+    # Ver comentário equivalente em Album.media_metadata_tags.
+    media_metadata_tags: list[str] = field(default_factory=list)
     copyright: str = ""
     replay_gain: Optional[float] = None
     peak: Optional[float] = None
@@ -150,6 +163,7 @@ class Track:
     def from_dict(cls, d: dict) -> "Track":
         d = d or {}
         album = d.get("album") if isinstance(d.get("album"), dict) else {}
+        media_metadata = d.get("mediaMetadata") if isinstance(d.get("mediaMetadata"), dict) else {}
         return cls(
             id=_int(d.get("id")),
             title=str(d.get("title") or "Unknown"),
@@ -166,6 +180,7 @@ class Track:
             isrc=str(d.get("isrc") or ""),
             audio_quality=str(d.get("audioQuality") or "").upper(),
             audio_modes=[str(m).upper() for m in (d.get("audioModes") or [])],
+            media_metadata_tags=[str(t).upper() for t in (media_metadata.get("tags") or [])],
             copyright=str(d.get("copyright") or ""),
             replay_gain=_float(d.get("replayGain")),
             peak=_float(d.get("peak")),
@@ -290,7 +305,7 @@ class Stream:
     """Manifesto decodificado, pronto para baixar."""
 
     track_id: int
-    quality: str  # tier de fato entregue (ex.: "LOSSLESS")
+    quality: str  # tier de fato entregue (ex.: "LOSSLESS") -- vem de audioQuality
     codec: str  # "flac", "aac", "mp4a.40.2"...
     urls: list[str]  # BTS: 1 URL. DASH: [init, seg1, seg2, ...]
     is_dash: bool = False
@@ -300,6 +315,12 @@ class Stream:
     peak: Optional[float] = None
     album_replay_gain: Optional[float] = None
     album_peak: Optional[float] = None
+    # "STEREO" ou "DOLBY_ATMOS" -- vem de audioMode, campo SEPARADO de
+    # audioQuality na resposta da Tidal (ver playbackinfopostpaywall). Os
+    # dois nunca se misturam: audioQuality nunca vale "DOLBY_ATMOS" (não é
+    # um valor válido do enum), então checar `quality == "DOLBY_ATMOS"``
+    # nunca detecta nada -- é audio_mode que tem que ser checado.
+    audio_mode: str = ""
 
     @property
     def is_flac(self) -> bool:

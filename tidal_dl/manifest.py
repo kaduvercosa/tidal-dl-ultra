@@ -28,7 +28,7 @@ import logging
 import xml.etree.ElementTree as ET
 from typing import Any, Optional
 
-from tidal_dl.constants import QUALITY_BY_NAME, QUALITY_MAP
+from tidal_dl.constants import DOLBY_ATMOS_TIER, DOLBY_CODECS, QUALITY_BY_NAME, QUALITY_MAP
 from tidal_dl.exceptions import (
     ForbiddenError,
     InvalidQuality,
@@ -36,6 +36,7 @@ from tidal_dl.exceptions import (
     NonStreamable,
     PreviewOnly,
     QualityUnavailable,
+    ResourceNotFoundError,
     UnsupportedProtection,
 )
 from tidal_dl.models import Stream
@@ -44,6 +45,13 @@ logger = logging.getLogger(__name__)
 
 _NS = {"mpd": "urn:mpeg:dash:schema:mpd:2011"}
 _OPEN = {"", "NONE", "OFFLINEONLY"}
+
+
+def _is_dolby_stream(stream: Stream) -> bool:
+    # audioMode é o campo certo (ver comentário em Stream.audio_mode). Mantém
+    # o cheque de codec como reforço/fallback pra resposta antiga sem o campo.
+    codec = (stream.codec or "").lower()
+    return stream.audio_mode.upper() == DOLBY_ATMOS_TIER or any(token in codec for token in DOLBY_CODECS)
 
 # Valores típicos por tier quando a resposta não informa profundidade/taxa.
 _TIER_DEFAULTS = {
@@ -106,10 +114,12 @@ def stream_from_playback(info: dict, track_id: int) -> Stream:
     mime = str(info.get("manifestMimeType") or "")
     raw = _decode_b64(info.get("manifest") or "")
     tier = str(info.get("audioQuality") or "").upper()
+    audio_mode = str(info.get("audioMode") or "").upper()
     depth_d, rate_d = _TIER_DEFAULTS.get(tier, (16, 44100))
     common = dict(
         track_id=track_id,
         quality=tier,
+        audio_mode=audio_mode,
         bit_depth=info.get("bitDepth") or depth_d,
         sample_rate=info.get("sampleRate") or rate_d,
         replay_gain=_f(info.get("trackReplayGain")),
@@ -154,48 +164,63 @@ async def resolve_stream(
     on_fallback: Any = None,
     preferred_tier: Optional[str] = None,
 ) -> Stream:
-    """Pede o stream no tier ``quality`` e, se preciso, desce até um que sirva.
+    """Resolve o stream, priorizando Atmos quando solicitado pelo catálogo.
 
-    Desce em: sem permissão (403), não-streamable, protegido. NÃO desce em
-    erro de rede/autenticação/rate limit (esses propagam).
-
-    ``preferred_tier`` (ex.: ``"DOLBY_ATMOS"``): tentado ANTES da escada
-    numérica normal, só quando a própria faixa já informa esse tier como o
-    audioQuality dela -- ver ``DOLBY_ATMOS_TIER`` em constants.py e o
-    chamador em downloader.py. A escada normal (0-4) nunca pede
-    "DOLBY_ATMOS" sozinha (não está em QUALITY_MAP), então sem isso o Tidal
-    fica livre pra devolver um downmix estéreo comum quando um tier normal é
-    pedido pra uma faixa que só existe "de verdade" em Atmos. Se o tier
-    preferido falhar (não aceito, indisponível, protegido), cai pra escada
-    normal sem barulho -- não é fatal, é só uma tentativa a mais.
+    A tentativa Atmos é isolada da escada PCM. Só é aceita se a resposta
+    confirmar Atmos pelo audioMode ou codec; resposta estéreo nunca é rotulada
+    como Atmos. Se Atmos não estiver disponível, segue a política PCM normal.
     """
     if quality not in QUALITY_MAP:
         raise InvalidQuality(f"qualidade inválida: {quality} (use 0-4)")
-    if preferred_tier:
+
+    atmos_expected = str(preferred_tier or "").upper() == DOLBY_ATMOS_TIER
+    last: Optional[Exception] = None
+
+    if atmos_expected:
         try:
-            info = await api.playback_info(track_id, preferred_tier)
-            return stream_from_playback(info, track_id)
+            info = await api.playback_info(track_id, DOLBY_ATMOS_TIER)
+            stream = stream_from_playback(info, track_id)
+            if _is_dolby_stream(stream):
+                return stream
+            logger.debug(
+                "faixa %s: solicitação Atmos retornou stream não-Atmos; usando fallback PCM",
+                track_id,
+            )
+            last = QualityUnavailable("a solicitação Atmos retornou stream não-Atmos")
         except PreviewOnly:
             raise
-        except (ForbiddenError, NonStreamable) as exc:
-            if isinstance(exc, ManifestError):
-                raise
-            logger.debug("tier preferido %s indisponível para %s: %s", preferred_tier, track_id, exc)
-    last: Optional[Exception] = None
+        except (ForbiddenError, NonStreamable, QualityUnavailable, ResourceNotFoundError) as exc:
+            # Alguns endpoints/sessões retornam 404 quando DOLBY_ATMOS não é
+            # aceito como audioquality. Trate-o como tentativa Atmos indisponível
+            # e permita o fallback PCM, sem mascarar 404s de tentativas PCM.
+            last = exc
+            logger.debug("faixa %s Atmos indisponível: %s", track_id, exc)
+
+        if not allow_fallback:
+            if last:
+                raise last
+            raise QualityUnavailable(f"Dolby Atmos indisponível para a faixa {track_id}")
+
     for rank in range(quality, -1, -1):
         name = QUALITY_MAP[rank]
         try:
             info = await api.playback_info(track_id, name)
             stream = stream_from_playback(info, track_id)
+            is_dolby = _is_dolby_stream(stream)
             returned_rank = QUALITY_BY_NAME.get((stream.quality or "").upper())
-            if returned_rank is not None and returned_rank < rank:
+            if not is_dolby and returned_rank is not None and returned_rank < rank:
                 raise QualityUnavailable(
                     f"tier {name} devolveu {stream.quality}, abaixo do solicitado"
                 )
+            if atmos_expected and not is_dolby:
+                logger.debug(
+                    "faixa %s: catálogo indicava Atmos, mas playback PCM entregou %s",
+                    track_id, name,
+                )
             return stream
         except PreviewOnly:
-            raise  # descer de qualidade não resolve prévia
-        except (ForbiddenError, NonStreamable) as exc:
+            raise
+        except (ForbiddenError, NonStreamable, QualityUnavailable) as exc:
             if isinstance(exc, ManifestError):
                 raise
             last = exc
@@ -204,7 +229,9 @@ async def resolve_stream(
                 break
             if on_fallback:
                 on_fallback(name, QUALITY_MAP[rank - 1], exc)
-    assert last is not None
+
+    if last is None:
+        raise QualityUnavailable(f"nenhum stream disponível para a faixa {track_id}")
     if isinstance(last, ForbiddenError):
         raise NonStreamable(f"sem permissão para baixar a faixa {track_id}: {last}") from last
     raise last

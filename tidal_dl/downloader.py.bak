@@ -798,9 +798,19 @@ class Downloader:
         total_items = len(tracks) + len(videos)
         mode = self._configure_mode(total_items)
 
-        # A qualidade sera identificada durante o download.
-        # Nao sondar previamente: isso duplica chamadas ao playback.
-        acquired_label = "Será determinada pelo download"
+        # SONDAGEM DE QUALIDADE ADQUIRIDA (PRE-FETCH)
+        acquired_label = "Desconhecida"
+        if tracks:
+            acquired_label = await self._probe_playback_quality(
+                tracks[0],
+                effective_quality(album, self.settings.quality),
+                is_dolby_atmos(
+                    album.audio_quality,
+                    album.audio_modes,
+                    album.media_metadata_tags,
+                ),
+            )
+
         target_label = acquired_label
         
         header_rows = [
