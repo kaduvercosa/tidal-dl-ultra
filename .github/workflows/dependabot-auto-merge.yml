@@ -1,0 +1,35 @@
+# Faz o merge automatico de PRs abertos pelo Dependabot quando a
+# atualizacao e do tipo "minor" ou "patch" (nao-breaking). PRs "major"
+# ficam parados esperando sua revisao manual, por seguranca.
+#
+# Pre-requisito: habilite "Allow auto-merge" em
+# Settings -> General -> Pull Requests, no repositorio no GitHub.
+
+name: Dependabot auto-merge
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  dependabot:
+    runs-on: ubuntu-latest
+    if: github.actor == 'dependabot[bot]'
+    steps:
+      - name: Ler metadados do Dependabot
+        id: metadata
+        uses: dependabot/fetch-metadata@v3
+        with:
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Habilita auto-merge para minor e patch
+        if: |
+          steps.metadata.outputs.update-type == 'version-update:semver-minor' ||
+          steps.metadata.outputs.update-type == 'version-update:semver-patch'
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
