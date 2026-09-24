@@ -232,7 +232,14 @@ async def run_online(command: str, args, settings: TidalDLSettings, paths: dict)
             summary = await tidal.download_urls(_expand_sources(args.SOURCE), include_eps=args.eps)
             return 1 if summary["failed"] else 0
         if command in ("search", "fun", "i"):
-            ok = await tidal.interactive(" ".join(args.QUERY), args.type)
+            if args.QUERY:
+                ok = await tidal.interactive(" ".join(args.QUERY), args.type)
+            else:
+                # Sem TERMO: abre o fluxo completo -- primeiro escolhe o tipo
+                # (ou "Favoritos"), depois pergunta o termo, só então mostra
+                # a tabela. Com TERMO já dado na linha de comando, continua
+                # indo direto pra busca (uso não-interativo/scripts).
+                ok = await tidal.interactive_menu()
             return 0 if ok else 1
         if command == "lucky":
             return 0 if await tidal.lucky(" ".join(args.QUERY), args.type, args.number) else 1
@@ -265,6 +272,18 @@ async def async_main(argv: Optional[list[str]] = None) -> int:
 
         rc = await cmd_config(_argparse.Namespace(show=False), paths)
         if getattr(args, "reset", False):
+            if rc == 0:
+                # Reset deu certo: cai direto na página inicial (mesmo texto
+                # que apareceria rodando `tidal-dl` sem argumentos), em vez
+                # de só voltar pro shell -- evita ter que rodar o comando de
+                # novo pra ver os próximos passos.
+                from tidal_dl.welcome import print_welcome
+
+                try:
+                    settings = TidalDLSettings.from_config(paths["config_file"])
+                except ConfigError:
+                    settings = TidalDLSettings()
+                print_welcome(parser, paths, settings)
             return rc
 
     # `-p`/`--purge`: apaga o banco de downloads-já-feitos e sai (sem pedir

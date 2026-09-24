@@ -79,6 +79,23 @@ def default_download_folder() -> str:
     return "TidalDownloads"
 
 
+def default_video_folder() -> str:
+    """Mesma auto-detecção de ``default_download_folder()``, para vídeos.
+
+    ANTES: ``video_directory`` no settings.py tinha só o literal relativo
+    "TidalVideos" como default (sem passar por is_ios()/Containers), então
+    no a-Shell ela resolvia relativa ao CWD (às vezes fora de ~/Documents,
+    dependendo de onde o a-Shell foi aberto) em vez de sempre cair dentro
+    de ~/Documents como a pasta de música principal já fazia.
+    """
+    ios_home = os.environ.get("TIDAL_DL_IOS_HOME")
+    if ios_home:
+        return os.path.join(ios_home, "TidalVideos")
+    if "Containers/Data/Application" in os.environ.get("HOME", ""):
+        return os.path.join(os.environ["HOME"], "Documents", "TidalVideos")
+    return "TidalVideos"
+
+
 # ---------------------------------------------------------------------------
 # Binários externos (opcionais)
 # ---------------------------------------------------------------------------

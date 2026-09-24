@@ -145,14 +145,33 @@ async def resolve_stream(
     *,
     allow_fallback: bool = True,
     on_fallback: Any = None,
+    preferred_tier: Optional[str] = None,
 ) -> Stream:
     """Pede o stream no tier ``quality`` e, se preciso, desce até um que sirva.
 
     Desce em: sem permissão (403), não-streamable, protegido. NÃO desce em
     erro de rede/autenticação/rate limit (esses propagam).
+
+    ``preferred_tier`` (ex.: ``"DOLBY_ATMOS"``): tentado ANTES da escada
+    numérica normal, só quando a própria faixa já informa esse tier como o
+    audioQuality dela -- ver ``DOLBY_ATMOS_TIER`` em constants.py e o
+    chamador em downloader.py. A escada normal (0-4) nunca pede
+    "DOLBY_ATMOS" sozinha (não está em QUALITY_MAP), então sem isso o Tidal
+    fica livre pra devolver um downmix estéreo comum quando um tier normal é
+    pedido pra uma faixa que só existe "de verdade" em Atmos. Se o tier
+    preferido falhar (não aceito, indisponível, protegido), cai pra escada
+    normal sem barulho -- não é fatal, é só uma tentativa a mais.
     """
     if quality not in QUALITY_MAP:
         raise InvalidQuality(f"qualidade inválida: {quality} (use 0-4)")
+    if preferred_tier:
+        try:
+            info = await api.playback_info(track_id, preferred_tier)
+            return stream_from_playback(info, track_id)
+        except PreviewOnly:
+            raise
+        except (ForbiddenError, NonStreamable) as exc:
+            logger.debug("tier preferido %s indisponível para %s: %s", preferred_tier, track_id, exc)
     last: Optional[Exception] = None
     for rank in range(quality, -1, -1):
         name = QUALITY_MAP[rank]

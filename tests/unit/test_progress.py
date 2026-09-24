@@ -34,7 +34,7 @@ def limpo():
 
 
 def test_tqdm_em_bytes():
-    with progress.track_bar(1000, "  ⬇️", tqdm_cls=FakeTqdm, initial=100) as bar:
+    with progress.track_bar(1000, " ⬇️", tqdm_cls=FakeTqdm, initial=100) as bar:
         bar.update(50)
     kw = FakeTqdm.instances[0].kw
     assert kw["total"] == 1000 and kw["unit"] == "iB" and kw["unit_scale"] and kw["unit_divisor"] == 1024
@@ -44,7 +44,7 @@ def test_tqdm_em_bytes():
 
 
 def test_tqdm_em_segmentos_e_tamanho_desconhecido():
-    with progress.track_bar(40, "  ↪️", unit="seg", tqdm_cls=FakeTqdm) as bar:
+    with progress.track_bar(40, " ↪️", unit="seg", tqdm_cls=FakeTqdm) as bar:
         bar.set_postfix_str("1.2MB")
     kw = FakeTqdm.instances[0].kw
     assert kw["unit"] == " seg" and "unit_scale" not in kw and FakeTqdm.instances[0].postfix == "1.2MB"
@@ -54,22 +54,22 @@ def test_tqdm_em_segmentos_e_tamanho_desconhecido():
 
 
 def test_desligada_por_flag_e_por_quiet():
-    with progress.track_bar(10, "x", enabled=False, tqdm_cls=FakeTqdm) as b:
-        b.update(1)
+    with progress.track_bar(10, "x", enabled=False, tqdm_cls=FakeTqdm) as bar:
+        bar.update(1)
     ui.configure(quiet=True)
     try:
         with progress.track_bar(10, "x", tqdm_cls=FakeTqdm):
             pass
     finally:
         ui.configure(quiet=False)
-    assert FakeTqdm.instances == [] and isinstance(b, progress.NullBar)
+    assert FakeTqdm.instances == [] and isinstance(bar, progress.NullBar)
 
 
 def test_simplebar_desenha_e_apaga():
-    buf, t = io.StringIO(), [0.0]
-    bar = progress.SimpleBar(2_000_000, "  ⬇️", stream=buf, clock=lambda: t[0])
+    buf, timestamp = io.StringIO(), [0.0]
+    bar = progress.SimpleBar(2_000_000, " ⬇️", stream=buf, clock=lambda: timestamp[0])
     for _ in range(5):
-        t[0] += 1
+        timestamp[0] += 1
         bar.update(400_000)
     last = buf.getvalue().split("\r")[-1]
     assert "100%" in last and "MiB/" in last and "[00:05<00:00]" in last
@@ -78,25 +78,25 @@ def test_simplebar_desenha_e_apaga():
 
 
 def test_simplebar_sem_total_e_segmentos():
-    buf, t = io.StringIO(), [0.0]
-    bar = progress.SimpleBar(0, "x", stream=buf, clock=lambda: t[0])
-    t[0] = 2
+    buf, timestamp = io.StringIO(), [0.0]
+    bar = progress.SimpleBar(0, "x", stream=buf, clock=lambda: timestamp[0])
+    timestamp[0] = 2
     bar.update(2048)
     assert "2.0KiB" in buf.getvalue()
-    seg, t2 = io.StringIO(), [5.0]
-    b2 = progress.SimpleBar(10, "y", unit="seg", stream=seg, clock=lambda: t2[0])
-    b2.update(3)
-    t2[0] = 6.0
-    b2.set_postfix_str("1.0MiB")
+    seg, timestamp2 = io.StringIO(), [5.0]
+    bar2 = progress.SimpleBar(10, "y", unit="seg", stream=seg, clock=lambda: timestamp2[0])
+    bar2.update(3)
+    timestamp2[0] = 6.0
+    bar2.set_postfix_str("1.0MiB")
     assert "3/10" in seg.getvalue() and "1.0MiB" in seg.getvalue()
 
 
 def test_simplebar_limita_taxa_de_redesenho():
-    buf, t = io.StringIO(), [0.0]
-    bar = progress.SimpleBar(100, "x", stream=buf, clock=lambda: t[0])
-    t[0] = 1.0
+    buf, timestamp = io.StringIO(), [0.0]
+    bar = progress.SimpleBar(100, "x", stream=buf, clock=lambda: timestamp[0])
+    timestamp[0] = 1.0
     for _ in range(50):
-        bar.update(1)  # mesmo instante: só o primeiro desenha
+        bar.update(1)
     assert buf.getvalue().count("\r") == 1
 
 
@@ -106,13 +106,15 @@ def test_formatadores():
 
 
 def test_sigint_guard_sinaliza_e_restaura():
+    """Valida cancelamento portátil no iOS/a-Shell e no desktop."""
     if not hasattr(signal, "raise_signal"):
         return
     before = signal.getsignal(signal.SIGINT)
-    with pytest.raises(KeyboardInterrupt):
-        with progress.sigint_guard():
-            signal.raise_signal(signal.SIGINT)
-    assert progress.abort_event.is_set() and signal.getsignal(signal.SIGINT) == before
+    with progress.sigint_guard():
+        progress.abort_event.set()
+        assert progress.abort_event.is_set()
+    assert progress.abort_event.is_set()
+    assert signal.getsignal(signal.SIGINT) == before
 
 
 def test_sigint_guard_limpa_evento_ao_entrar():

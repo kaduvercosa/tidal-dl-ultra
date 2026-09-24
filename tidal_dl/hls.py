@@ -1,34 +1,4 @@
-"""Download de vídeos HLS (M3U8) do Tidal: master/media playlist, AES-128, segmentos.
-
-CONTEXTO
---------
-Vídeo do Tidal é entregue como HLS (``.m3u8``), diferente do DASH usado no
-áudio Hi-Res. Duas camadas de playlist:
-
-  * **master** (``#EXT-X-STREAM-INF`` + uma URL por variante) -- lista as
-    qualidades disponíveis (uma por faixa de bitrate);
-  * **media** (lista de segmentos, cada um opcionalmente precedido por
-    ``#EXT-X-KEY`` quando o CDN criptografa com AES-128).
-
-Isso é decodificação de HLS "de manifesto público" -- os mesmos dados que
-qualquer player recebe e usa para tocar o vídeo dentro da sessão autenticada
-normal; não há nenhum DRM (Widevine/FairPlay) envolvido, só o AES-128 padrão
-do próprio formato HLS (RFC 8216 §5.2), cuja chave vem no manifesto que a API
-já entrega para quem tem permissão de reproduzir o conteúdo.
-
-CONTAINER DE SAÍDA
--------------------
-* Segmentos ``.ts`` (o caso comum): concatenados num único ``.ts``; se
-  ``ffmpeg`` existir, o downloader faz um remux ``-c copy`` para ``.mp4``
-  depois (função em ``downloader.py``). Sem ffmpeg, o ``.ts`` já é um
-  arquivo de vídeo válido (toca no VLC e na maioria dos players).
-* Segmentos fragmentados (``.m4s``/``.mp4``, com ``EXT-X-MAP`` de
-  inicialização): concatenar init + segmentos EM ORDEM já produz um MP4
-  fragmentado válido -- não precisa de remux.
-
-Sem resumo entre execuções (ao contrário do áudio): um vídeo interrompido
-recomeça do zero. Cada segmento individual tem retry.
-"""
+"""Download de vídeos HLS (M3U8): playlists, AES-128 e segmentos."""
 
 from __future__ import annotations
 
@@ -41,35 +11,28 @@ from urllib.parse import urljoin
 
 from tidal_dl.exceptions import DownloadError, PermanentDownloadError
 from tidal_dl.net import NetworkError
-from tidal_dl.utils import retry_async
+from tidal_dl.utils import human_size, retry_async
 
 logger = logging.getLogger(__name__)
-
 _ATTR_RE = re.compile(r'([A-Z0-9-]+)=("(?:[^"]*)"|[^,]*)')
 
 
 class MissingDependencyError(DownloadError):
-    """Falta um pacote opcional (ex.: ``cryptography``) para continuar."""
+    """Falta um pacote opcional, como cryptography."""
 
 
 def _parse_attrs(line: str) -> dict:
-    """``METHOD=AES-128,URI="k",IV=0x0102`` -> ``{"METHOD": "AES-128", ...}`` (aspas removidas)."""
-    out = {}
-    for key, raw in _ATTR_RE.findall(line):
-        out[key] = raw[1:-1] if raw.startswith('"') and raw.endswith('"') else raw
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Estruturas
-# ---------------------------------------------------------------------------
+    return {
+        key: raw[1:-1] if raw.startswith('"') and raw.endswith('"') else raw
+        for key, raw in _ATTR_RE.findall(line)
+    }
 
 
 @dataclass(frozen=True)
 class Key:
     method: str
     uri: str
-    iv: Optional[bytes] = None  # None => deriva da sequência do segmento (RFC 8216 §5.2)
+    iv: Optional[bytes] = None
 
 
 @dataclass(frozen=True)
@@ -82,7 +45,7 @@ class Segment:
 @dataclass
 class MediaPlaylist:
     segments: list[Segment] = field(default_factory=list)
-    init_url: Optional[str] = None  # EXT-X-MAP (fmp4)
+    init_url: Optional[str] = None
     is_fragmented: bool = False
 
 
@@ -93,33 +56,25 @@ class Variant:
     resolution: str = ""
 
 
-# ---------------------------------------------------------------------------
-# Parsing
-# ---------------------------------------------------------------------------
-
-
 def is_master_playlist(text: str) -> bool:
     return "#EXT-X-STREAM-INF" in text
 
 
 def parse_master_playlist(text: str, base_url: str) -> list[Variant]:
-    """Extrai as variantes (qualidades) de um master playlist."""
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
     variants = []
-    for i, line in enumerate(lines):
+    for index, line in enumerate(lines):
         if not line.startswith("#EXT-X-STREAM-INF"):
             continue
         attrs = _parse_attrs(line.split(":", 1)[1] if ":" in line else "")
-        if i + 1 >= len(lines) or lines[i + 1].startswith("#"):
+        if index + 1 >= len(lines) or lines[index + 1].startswith("#"):
             continue
-        url = lines[i + 1]
-        if not url.startswith("http"):
-            url = urljoin(base_url, url)
-        try:
-            bandwidth = int(attrs.get("BANDWIDTH", "0"))
-        except ValueError:
-            bandwidth = 0
-        variants.append(Variant(bandwidth, url, attrs.get("RESOLUTION", "")))
+        url = lines[index + 1]
+        variants.append(Variant(
+            int(attrs.get("BANDWIDTH", "0") or 0),
+            url if url.startswith("http") else urljoin(base_url, url),
+            attrs.get("RESOLUTION", ""),
+        ))
     if not variants:
         raise DownloadError("master playlist HLS sem variantes (#EXT-X-STREAM-INF)")
     return variants
@@ -129,8 +84,7 @@ _QUALITY_RANK = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
 
 
 def pick_variant(variants: list[Variant], quality: str = "HIGH") -> Variant:
-    """Escolhe a variante pelo bitrate: ``LOW``/``MEDIUM``/``HIGH`` = menor/mediana/maior."""
-    ordered = sorted(variants, key=lambda v: v.bandwidth)
+    ordered = sorted(variants, key=lambda variant: variant.bandwidth)
     rank = _QUALITY_RANK.get((quality or "HIGH").upper(), 2)
     if rank == 0:
         return ordered[0]
@@ -140,16 +94,15 @@ def pick_variant(variants: list[Variant], quality: str = "HIGH") -> Variant:
 
 
 def _iv_from_hex(raw: str) -> bytes:
-    hexstr = raw[2:] if raw.lower().startswith("0x") else raw
-    iv = bytes.fromhex(hexstr)
+    value = raw[2:] if raw.lower().startswith("0x") else raw
+    iv = bytes.fromhex(value)
     if len(iv) != 16:
         raise DownloadError(f"IV de HLS com tamanho inválido: {len(iv)} bytes")
     return iv
 
 
 def parse_media_playlist(text: str, base_url: str) -> MediaPlaylist:
-    """Extrai os segmentos (com sua chave, se houver) de um media playlist."""
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
     playlist = MediaPlaylist()
     current_key: Optional[Key] = None
     sequence = 0
@@ -160,8 +113,7 @@ def parse_media_playlist(text: str, base_url: str) -> MediaPlaylist:
             except (IndexError, ValueError):
                 pass
         elif line.startswith("#EXT-X-MAP"):
-            attrs = _parse_attrs(line.split(":", 1)[1])
-            uri = attrs.get("URI", "")
+            uri = _parse_attrs(line.split(":", 1)[1]).get("URI", "")
             if uri:
                 playlist.init_url = uri if uri.startswith("http") else urljoin(base_url, uri)
                 playlist.is_fragmented = True
@@ -179,7 +131,8 @@ def parse_media_playlist(text: str, base_url: str) -> MediaPlaylist:
             playlist.segments.append(Segment(url, sequence, current_key))
             sequence += 1
     if not playlist.is_fragmented and any(
-        s.url.rsplit("?", 1)[0].endswith((".m4s", ".mp4", ".cmfv", ".cmfa")) for s in playlist.segments
+        segment.url.rsplit("?", 1)[0].endswith((".m4s", ".mp4", ".cmfv", ".cmfa"))
+        for segment in playlist.segments
     ):
         playlist.is_fragmented = True
     if not playlist.segments:
@@ -188,71 +141,56 @@ def parse_media_playlist(text: str, base_url: str) -> MediaPlaylist:
 
 
 def derive_iv(key: Key, sequence: int) -> bytes:
-    """IV explícito do manifesto, ou a sequência do segmento (RFC 8216 §5.2)."""
     return key.iv if key.iv is not None else sequence.to_bytes(16, "big")
 
 
 def decrypt_segment(data: bytes, key_bytes: bytes, iv: bytes) -> bytes:
-    """AES-128-CBC com padding PKCS7 (o método ``AES-128`` do HLS). Requer ``cryptography``."""
     try:
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-        from cryptography.hazmat.primitives import padding as _padding
+        from cryptography.hazmat.primitives import padding as pkcs7
     except ImportError as exc:
         raise MissingDependencyError(
-            "este vídeo tem segmentos criptografados (AES-128); instale o pacote "
+            "este vídeo tem segmentos criptografados (AES-128); instale "
             "'cryptography' para baixá-lo: pip install cryptography"
         ) from exc
     decryptor = Cipher(algorithms.AES(key_bytes), modes.CBC(iv)).decryptor()
     padded = decryptor.update(data) + decryptor.finalize()
-    unpadder = _padding.PKCS7(128).unpadder()
+    unpadder = pkcs7.PKCS7(128).unpadder()
     return unpadder.update(padded) + unpadder.finalize()
 
 
-# ---------------------------------------------------------------------------
-# Rede
-# ---------------------------------------------------------------------------
-
-
 async def _get_text(api_http: Any, url: str) -> str:
-    resp = await api_http.request("GET", url)
-    if resp.status in (401, 403, 404, 451):
-        raise PermanentDownloadError(f"HTTP {resp.status} ao buscar playlist HLS")
-    if resp.status >= 400:
-        raise DownloadError(f"HTTP {resp.status} ao buscar playlist HLS")
-    return resp.content.decode("utf-8", errors="replace")
+    response = await api_http.request("GET", url)
+    if response.status in (401, 403, 404, 451):
+        raise PermanentDownloadError(f"HTTP {response.status} ao buscar playlist HLS")
+    if response.status >= 400:
+        raise DownloadError(f"HTTP {response.status} ao buscar playlist HLS")
+    return response.content.decode("utf-8", errors="replace")
 
 
 async def _get_bytes(api_http: Any, url: str) -> bytes:
-    async with api_http.stream(url) as r:
-        if r.status in (401, 403, 404, 451):
-            raise PermanentDownloadError(f"HTTP {r.status} em segmento HLS")
-        if r.status >= 400:
-            raise DownloadError(f"HTTP {r.status} em segmento HLS")
-        buf = bytearray()
-        async for chunk in r.iter_chunks(1 << 17):
-            buf += chunk
-        if not buf:
-            raise DownloadError("segmento HLS vazio")
-        return bytes(buf)
+    async with api_http.stream(url) as response:
+        if response.status in (401, 403, 404, 451):
+            raise PermanentDownloadError(f"HTTP {response.status} em segmento HLS")
+        if response.status >= 400:
+            raise DownloadError(f"HTTP {response.status} em segmento HLS")
+        buffer = bytearray()
+        async for chunk in response.iter_chunks(1 << 17):
+            buffer += chunk
+    if not buffer:
+        raise DownloadError("segmento HLS vazio")
+    return bytes(buffer)
 
 
 async def resolve_media_playlist(api_http: Any, top_url: str, quality: str = "HIGH") -> MediaPlaylist:
-    """Segue master -> media (se preciso) e devolve os segmentos já resolvidos."""
     text = await _get_text(api_http, top_url)
     if is_master_playlist(text):
         variant = pick_variant(parse_master_playlist(text, top_url), quality)
         text = await _get_text(api_http, variant.url)
-        base = variant.url
+        base_url = variant.url
     else:
-        base = top_url
-    return parse_media_playlist(text, base)
-
-
-# ---------------------------------------------------------------------------
-# Orquestração
-# ---------------------------------------------------------------------------
-
-ProgressBar = Any  # objeto com .update(n) -- ver tidal_dl.progress
+        base_url = top_url
+    return parse_media_playlist(text, base_url)
 
 
 async def download_hls(
@@ -263,17 +201,13 @@ async def download_hls(
     quality: str = "HIGH",
     retries: int = 3,
     sleep: Callable[[float], Any] = asyncio.sleep,
-    bar: Optional[ProgressBar] = None,
+    bar: Optional[Any] = None,
     on_retry: Optional[Callable[[int, BaseException], None]] = None,
     abort_check: Optional[Callable[[], bool]] = None,
+    playlist: Optional[MediaPlaylist] = None,
 ) -> dict:
-    """Baixa (e decripta se preciso) um vídeo HLS inteiro para ``dest_path``.
-
-    Devolve ``{"segments", "bytes", "fragmented"}``. ``dest_path`` já é um MP4
-    fragmentado válido quando ``fragmented`` é True; senão é um ``.ts`` cru
-    (o remux para ``.mp4`` via ffmpeg, se houver, é feito por quem chama).
-    """
-    playlist = await resolve_media_playlist(api_http, top_url, quality)
+    if playlist is None:
+        playlist = await resolve_media_playlist(api_http, top_url, quality)
     key_cache: dict[str, bytes] = {}
     total_bytes = 0
 
@@ -282,40 +216,39 @@ async def download_hls(
             key_cache[key.uri] = await _get_bytes(api_http, key.uri)
         return key_cache[key.uri]
 
-    async def one_segment(seg: Segment) -> bytes:
-        raw = await _get_bytes(api_http, seg.url)
-        if seg.key is None or seg.key.method == "NONE":
+    async def one_segment(segment: Segment) -> bytes:
+        raw = await _get_bytes(api_http, segment.url)
+        if segment.key is None or segment.key.method == "NONE":
             return raw
-        if seg.key.method != "AES-128":
-            raise DownloadError(f"método de criptografia HLS não suportado: {seg.key.method}")
-        key_bytes = await fetch_key(seg.key)
-        return decrypt_segment(raw, key_bytes, derive_iv(seg.key, seg.sequence))
+        if segment.key.method != "AES-128":
+            raise DownloadError(f"método de criptografia HLS não suportado: {segment.key.method}")
+        return decrypt_segment(raw, await fetch_key(segment.key), derive_iv(segment.key, segment.sequence))
 
-    with open(dest_path, "wb") as out:
+    with open(dest_path, "wb") as output:
         if playlist.init_url:
-            out.write(await _get_bytes(api_http, playlist.init_url))
-
-        for seg in playlist.segments:
+            output.write(await _get_bytes(api_http, playlist.init_url))
+        for segment in playlist.segments:
             if abort_check and abort_check():
                 raise KeyboardInterrupt
 
-            def retry_cb(n: int, exc: BaseException, _seg=seg) -> None:
+            def retry_callback(number: int, exc: BaseException) -> None:
                 if on_retry:
-                    on_retry(n, exc)
+                    on_retry(number, exc)
 
             data = await retry_async(
-                lambda _seg=seg: one_segment(_seg),
-                attempts=retries,
-                base_delay=1.5,
+                lambda: one_segment(segment), attempts=retries, base_delay=1.5,
                 retry_on=(NetworkError, DownloadError, OSError),
-                give_up_on=(asyncio.CancelledError, KeyboardInterrupt, PermanentDownloadError, MissingDependencyError),
-                sleep=sleep,
-                on_retry=retry_cb,
+                give_up_on=(asyncio.CancelledError, KeyboardInterrupt,
+                            PermanentDownloadError, MissingDependencyError),
+                sleep=sleep, on_retry=retry_callback,
             )
-            out.write(data)
+            output.write(data)
             total_bytes += len(data)
             if bar is not None:
-                bar.update(len(data))
+                bar.update(1)
+                set_postfix = getattr(bar, "set_postfix_str", None)
+                if set_postfix:
+                    set_postfix(human_size(total_bytes))
 
     if total_bytes == 0:
         raise DownloadError("download de vídeo vazio")

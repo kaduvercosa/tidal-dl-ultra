@@ -40,8 +40,19 @@ def build_tags(
     total_tracks: Optional[int] = None,
     total_discs: Optional[int] = None,
     lyrics: str = "",
+    lyrics_synced: str = "",
 ) -> dict[str, str]:
-    """Dicionário ``CHAVE -> valor`` (estilo Vorbis). Valores vazios são omitidos."""
+    """Dicionário ``CHAVE -> valor`` (estilo Vorbis). Valores vazios são omitidos.
+
+    ``LYRICS`` prefere a versão SINCRONIZADA (LRC, ``[mm:ss.xx] ...``) quando
+    ela existe -- a maioria dos players que leem essa tag mostra o texto
+    igual mesmo sem suportar sincronia, e os poucos que suportam ganham a
+    sincronia de graça. ANTES só a versão plana ia pra tag, mesmo quando uma
+    versão sincronizada estava disponível (o ``.lrc`` avulso continua sendo
+    a fonte "oficial" de sincronia pra quem prefere isso a um tag).
+    ``UNSYNCEDLYRICS`` guarda sempre a versão plana à parte, pros players/
+    taggers que procuram especificamente por ela.
+    """
     tg = stream.replay_gain if stream.replay_gain is not None else track.replay_gain
     tp = stream.peak if stream.peak is not None else track.peak
     tags: dict[str, Any] = {
@@ -59,7 +70,8 @@ def build_tags(
         "BARCODE": album.upc or None,
         "COPYRIGHT": track.copyright or album.copyright or None,
         "BPM": track.bpm,
-        "LYRICS": lyrics or None,
+        "LYRICS": lyrics_synced or lyrics or None,
+        "UNSYNCEDLYRICS": lyrics or None,
         "REPLAYGAIN_TRACK_GAIN": _db(tg),
         "REPLAYGAIN_TRACK_PEAK": _peak(tp),
         "REPLAYGAIN_ALBUM_GAIN": _db(stream.album_replay_gain),
@@ -115,7 +127,7 @@ def tag_m4a(path: str, tags: dict[str, str], cover: Optional[bytes] = None) -> N
         audio["tmpo"] = [int(tags["BPM"])]
     if tags.get("ITUNESADVISORY"):
         audio["rtng"] = [1]
-    for key in ("ISRC", "BARCODE", "TIDALTRACKID", "TIDALALBUMID",
+    for key in ("ISRC", "BARCODE", "TIDALTRACKID", "TIDALALBUMID", "UNSYNCEDLYRICS",
                 "REPLAYGAIN_TRACK_GAIN", "REPLAYGAIN_TRACK_PEAK",
                 "REPLAYGAIN_ALBUM_GAIN", "REPLAYGAIN_ALBUM_PEAK"):
         if tags.get(key):

@@ -108,18 +108,24 @@ def test_lucky_e_busca_vazia(tmp_path):
                                            "releaseDate": "2020-01-01", "audioQuality": "LOSSLESS"})[1].startswith("A - X")
 
 
-def test_interactive_com_selecao(tmp_path):
+def test_interactive_com_selecao(tmp_path, monkeypatch):
     sc, t = make(tmp_path)
 
-    async def ask():
-        return "1"
+    # interactive() agora abre a TUI em tela cheia (prompt_toolkit) em vez
+    # de pedir um número por input() de texto -- mocka core._tui_select
+    # (mesma técnica usada nos testes do qobuz-dl-ultra) pra não precisar
+    # de um terminal de verdade rodando em CI.
+    async def escolhe_primeiro(title, options, is_multi=False, item_category="album"):
+        return [(options[0], 0)]
 
-    assert run(t.interactive("art", "album", ask=ask)) is True
+    monkeypatch.setattr(core, "_tui_select", escolhe_primeiro)
+    assert run(t.interactive("art", "album")) is True
 
-    async def nada():
-        return "q"
+    async def cancela(title, options, is_multi=False, item_category="album"):
+        raise KeyboardInterrupt
 
-    assert run(t.interactive("art", "album", ask=nada)) is False
+    monkeypatch.setattr(core, "_tui_select", cancela)
+    assert run(t.interactive("art", "album")) is False
 
 
 def test_refresh_renovado_e_persistido(tmp_path):

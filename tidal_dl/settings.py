@@ -22,7 +22,13 @@ from tidal_dl.constants import (
     TRACK_PLACEHOLDERS,
 )
 from tidal_dl.exceptions import ConfigError
-from tidal_dl.utils import atomic_write_text, default_download_folder, is_ios, validate_template
+from tidal_dl.utils import (
+    atomic_write_text,
+    default_download_folder,
+    default_video_folder,
+    is_ios,
+    validate_template,
+)
 
 SECTION = "tidal"
 
@@ -30,7 +36,7 @@ SECTION = "tidal"
 @dataclass
 class TidalDLSettings:
     directory: str = field(default_factory=default_download_folder)
-    video_directory: str = "TidalVideos"
+    video_directory: str = field(default_factory=default_video_folder)
     quality: int = DEFAULT_QUALITY
     video_quality: str = "HIGH"  # LOW | MEDIUM | HIGH (enum da API, não resolução em pixels)
     allow_quality_fallback: bool = True
@@ -143,7 +149,16 @@ class TidalDLSettings:
             self.embed_art = False
             self.save_cover_file = False
         if is_ios():
-            ios_home = os.environ.get("TIDAL_DL_IOS_HOME")
+            # ANTES: só prefixava se a variável TIDAL_DL_IOS_HOME estivesse
+            # setada explicitamente -- mas is_ios() também detecta o a-Shell
+            # sozinho (via "Containers/Data/Application" no $HOME), e nesse
+            # caso `ios_home` ficava vazio e o prefixo nunca era aplicado,
+            # deixando pastas relativas passadas por -d/-D (ou lidas de um
+            # config.ini antigo) resolverem contra o CWD em vez de
+            # ~/Documents. Mesma auto-detecção do default_video_folder().
+            ios_home = os.environ.get("TIDAL_DL_IOS_HOME") or os.path.join(
+                os.environ.get("HOME", ""), "Documents"
+            )
             if ios_home:
                 if self.directory and not os.path.isabs(self.directory):
                     self.directory = os.path.join(ios_home, self.directory)

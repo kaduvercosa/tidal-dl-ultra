@@ -168,12 +168,12 @@ def print_welcome(parser: argparse.ArgumentParser, paths: dict, settings) -> Non
         label = name if not aliases else f"{name} ({aliases})"
         ui.wrapped(f"{ACCENT}{label}{OFF}", indent=2)
         ui.wrapped(COMMAND_DESCRIPTIONS_PT.get(name, help_text), indent=4)
-    ui.blank()
+        ui.blank()
 
     ui.emit(f"{ACCENT}{BG}FLAGS GLOBAIS:{RESET} {MUTED}(valem para qualquer comando){OFF}\n" if cols >= 62
             else f"{BG}FLAGS GLOBAIS:{RESET}\n")
     for flag_str, dest, help_text in extract_global_flags(parser):
-        ui.emit(f"  {ACCENT}{flag_str}{OFF}")
+        ui.emit(f" {ACCENT}{flag_str}{OFF}")
         ui.wrapped(FLAG_DESCRIPTIONS_PT.get(dest, help_text), indent=4)
-    ui.blank()
+        ui.blank()
     ui.rule("=")

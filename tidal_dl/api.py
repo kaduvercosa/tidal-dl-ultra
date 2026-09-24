@@ -126,7 +126,19 @@ class TidalAPI:
 
     async def _paged_items(self, endpoint: str, *, extra: Optional[dict] = None) -> list[dict]:
         """Junta todas as páginas de ``.../items`` (desembrulha ``{item, type}``)."""
-        out: list[dict] = []
+        return [d for t, d in await self._paged_items_typed(endpoint, extra=extra) if t == "track"]
+
+    async def _paged_items_typed(
+        self, endpoint: str, *, extra: Optional[dict] = None
+    ) -> list[tuple[str, dict]]:
+        """Como ``_paged_items``, mas preserva o ``type`` de cada entrada
+        (``"track"``/``"video"``) em vez de descartar tudo que não é faixa.
+
+        Usado por ``get_album_items`` para não perder mais vídeos embutidos
+        num álbum (deluxe editions costumam ter 1-2 videoclipes junto das
+        faixas) -- ver comentário em ``get_album_items``.
+        """
+        out: list[tuple[str, dict]] = []
         offset = 0
         while True:
             params = {"limit": PAGE, "offset": offset, **(extra or {})}
@@ -135,9 +147,10 @@ class TidalAPI:
             for entry in items:
                 if not isinstance(entry, dict):
                     continue
-                if entry.get("type") not in (None, "track"):
-                    continue  # vídeos etc.
-                out.append(entry.get("item", entry))
+                etype = entry.get("type") or "track"
+                if etype not in ("track", "video"):
+                    continue
+                out.append((etype, entry.get("item", entry)))
             total = int(body.get("totalNumberOfItems") or 0)
             if not items or len(items) < PAGE or (total and offset + len(items) >= total):
                 break
@@ -147,9 +160,31 @@ class TidalAPI:
     async def get_album_tracks(self, album_id: Any) -> list[Track]:
         return [Track.from_dict(i) for i in await self._paged_items(f"albums/{album_id}/items")]
 
+    async def get_album_items(self, album_id: Any) -> tuple[list[Track], list[Video]]:
+        """``(faixas, vídeos)`` de um álbum.
+
+        ANTES: ``_paged_items`` descartava silenciosamente qualquer entrada
+        com ``type != "track"`` ("# vídeos etc." no comentário original) --
+        álbuns/deluxe editions que trazem um videoclipe junto das faixas
+        (comum em lançamentos "deluxe: ... visualizer" etc.) tinham esse
+        vídeo simplesmente ignorado: não contava nas faixas do álbum, não
+        baixava com o resto. Agora os dois tipos são preservados numa única
+        passada pela paginação (não busca a lista 2x).
+        """
+        entries = await self._paged_items_typed(f"albums/{album_id}/items")
+        tracks = [Track.from_dict(d) for t, d in entries if t == "track"]
+        videos = [Video.from_dict(d) for t, d in entries if t == "video"]
+        return tracks, videos
+
     async def get_album_with_tracks(self, album_id: Any) -> tuple[Album, list[Track]]:
-        album, tracks = await asyncio.gather(self.get_album(album_id), self.get_album_tracks(album_id))
+        album, tracks, _videos = await self.get_album_with_items(album_id)
         return album, tracks
+
+    async def get_album_with_items(self, album_id: Any) -> tuple[Album, list[Track], list[Video]]:
+        album, (tracks, videos) = await asyncio.gather(
+            self.get_album(album_id), self.get_album_items(album_id)
+        )
+        return album, tracks, videos
 
     async def get_track(self, track_id: Any) -> Track:
         return Track.from_dict(await self.get(f"tracks/{track_id}"))
@@ -196,6 +231,22 @@ class TidalAPI:
     async def favorite_tracks_page(self, *, limit: int = 100, offset: int = 0) -> Page:
         return Page.from_dict(
             await self.get(f"users/{self.user_id}/favorites/tracks", {"limit": limit, "offset": offset})
+        )
+
+    async def favorite_artists_page(self, *, limit: int = 100, offset: int = 0) -> Page:
+        return Page.from_dict(
+            await self.get(
+                f"users/{self.user_id}/favorites/artists",
+                {"limit": limit, "offset": offset, "order": "DATE", "orderDirection": "DESC"},
+            )
+        )
+
+    async def favorite_playlists_page(self, *, limit: int = 100, offset: int = 0) -> Page:
+        return Page.from_dict(
+            await self.get(
+                f"users/{self.user_id}/favorites/playlists",
+                {"limit": limit, "offset": offset, "order": "DATE", "orderDirection": "DESC"},
+            )
         )
 
     # -- letras / playback -------------------------------------------------

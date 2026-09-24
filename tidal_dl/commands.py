@@ -125,10 +125,12 @@ def dl_args(sub):
 
 
 def search_args(sub):
-    p = sub.add_parser("search", aliases=["fun", "i"], usage="tidal-dl search [-t TIPO] TERMO...",
+    p = sub.add_parser("search", aliases=["fun", "i"], usage="tidal-dl search [-t TIPO] [TERMO...]",
                        help="busca e escolhe o que baixar",
-                       description="Busca no catálogo e deixa escolher por número (ex.: 1,3-5).")
-    p.add_argument("QUERY", nargs="+", help="termo de busca")
+                       description="Busca no catálogo e deixa escolher numa tabela. Sem TERMO, abre "
+                                    "o modo interativo completo (escolhe o tipo, depois o termo, com "
+                                    "opção de favoritos) -- estilo qobuz-dl-ultra.")
+    p.add_argument("QUERY", nargs="*", help="termo de busca (omita pra abrir o modo interativo completo)")
     p.add_argument("-t", "--type", choices=SEARCH_TYPES, default="album", help="tipo (padrão: album)")
     add_common_arg(p)
     return p
