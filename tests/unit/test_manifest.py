@@ -143,3 +143,14 @@ def test_manifesto_ilegivel_nao_faz_fallback():
     with pytest.raises(ManifestError):
         run(m.resolve_stream(api, 1, 4))
     assert api.asked == ["HI_RES_LOSSLESS"]
+
+
+def test_resolve_detecta_downgrade_silencioso_da_api():
+    returned_lower = bts()
+    returned_lower["audioQuality"] = "HI_RES"
+    api = FakeAPI({"HI_RES_LOSSLESS": returned_lower, "HI_RES": dash(quality="HI_RES")})
+    fallbacks = []
+    stream = run(m.resolve_stream(api, 1, 4, on_fallback=lambda a, b, e: fallbacks.append((a, b))))
+    assert stream.quality == "HI_RES"
+    assert api.asked == ["HI_RES_LOSSLESS", "HI_RES"]
+    assert fallbacks == [("HI_RES_LOSSLESS", "HI_RES")]

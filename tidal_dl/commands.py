@@ -88,7 +88,7 @@ def add_common_arg(p: argparse.ArgumentParser) -> None:
                    help="não grava .streamrip.json nas pastas")
     p.add_argument("--no-lyrics", action="store_true", default=False, help="não busca letras")
     p.add_argument("--no-lyrics-fallback", action="store_true", default=False,
-                   help="não completa letras faltantes no Tidal usando o LRCLIB")
+                   help="não completa letras faltantes no Tidal usando Musixmatch/LRCLIB")
     p.add_argument("--no-cover", action="store_true", default=False, help="não baixa/embute capa")
     p.add_argument("--no-fallback", action="store_true", default=False,
                    help="falha em vez de baixar em qualidade menor quando a pedida não existir")
@@ -209,6 +209,31 @@ def stats_args(sub):
     return sub.add_parser("stats", help="estatísticas dos seus downloads")
 
 
+def lyrics_args(sub):
+    p = sub.add_parser(
+        "lyrics", usage="tidal-dl lyrics [opções] [DIR]",
+        help="preenche letras ausentes na biblioteca local",
+        description="Varre FLAC/M4A/MP3, lê artista e faixa dos metadados e busca "
+                    "em Musixmatch e LRCLIB sem baixar o áudio novamente.",
+    )
+    p.add_argument("DIR", nargs="?", default=None, help="pasta a varrer (padrão: diretório de downloads)")
+    p.add_argument("--force", action="store_true", default=False, help="substitui letras já existentes")
+    p.add_argument("--dry-run", action="store_true", default=False, help="não grava; apenas mostra o que faria")
+    p.add_argument("--limit", type=int, default=None, metavar="N", help="limita a N arquivos")
+    return p
+
+
+def inspect_args(sub):
+    p = sub.add_parser(
+        "inspect", help="inspeciona qualidade, tags e letras dos arquivos locais",
+        description="Mostra codec, profundidade, sample rate e presença de letras sem alterar arquivos.",
+    )
+    p.add_argument("DIR", nargs="?", default=None, help="pasta a varrer (padrão: diretório de downloads)")
+    p.add_argument("--json", action="store_true", default=False, help="imprime relatório JSON")
+    p.add_argument("--limit", type=int, default=None, metavar="N", help="limita a N arquivos")
+    return p
+
+
 def config_args(sub):
     p = sub.add_parser("config", help="assistente de configuração (config.ini)")
     p.add_argument("--show", action="store_true", default=False, help="só mostra a configuração atual")
@@ -231,6 +256,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-color", action="store_true", default=False, help="sem cores")
     sub = parser.add_subparsers(dest="command", metavar="comando", title="comandos")
     for fn in (login_args, logout_args, user_args, dl_args, search_args, lucky_args,
-               sync_favorites_args, scan_args, library_args, doctor_args, stats_args, config_args):
+               sync_favorites_args, scan_args, library_args, doctor_args, stats_args,
+               lyrics_args, inspect_args, config_args):
         fn(sub)
     return parser

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import shutil
@@ -37,7 +38,6 @@ from tidal_dl.exceptions import (
     NonStreamable,
     PermanentDownloadError,
     PreviewOnly,
-    ResourceNotFoundError,
 )
 from tidal_dl import hls
 from tidal_dl.manifest import resolve_stream, resolve_video_playback
@@ -74,6 +74,11 @@ class TrackResult:
     bit_depth: Optional[int] = None
     sample_rate: Optional[int] = None
     requested_quality: Optional[int] = None
+    fallback_steps: list[tuple[str, str, str]] = field(default_factory=list)
+    quality_reason: str = ""
+    item_kind: str = "faixa"
+    item_index: int = 0
+    item_total: int = 0
 
 
 @dataclass
@@ -136,6 +141,20 @@ def effective_quality(album: Album, configured: int) -> int:
     return min(configured, maximum) if maximum is not None else configured
 
 
+def quality_request_reason(album: Album, configured: int, requested: int) -> str:
+    """Explica por que o tier efetivamente pedido pode ser menor que o config."""
+    if requested >= configured:
+        return ""
+    maximum = album.max_quality_rank
+    if maximum is None:
+        return ""
+    return (
+        f"o catálogo informou que este álbum tem no máximo "
+        f"{QUALITY_MAP[maximum]} ({QUALITY_LABELS[maximum]}); "
+        f"o programa não pediu {QUALITY_MAP[configured]} para não mascarar essa limitação"
+    )
+
+
 async def run_limited(coros: list, limit: int) -> list:
     sem = asyncio.Semaphore(max(1, limit))
 
@@ -167,6 +186,7 @@ class Downloader:
         self._parallel = False
         self._workers = 1
         self._lyrics_print_lock = asyncio.Lock()
+        self._musixmatch = lyr.MusixmatchClient(self.api.http)
 
     def _video_root(self) -> str:
         """Mantém vídeo fora da árvore que o player de música indexa."""
@@ -402,7 +422,10 @@ class Downloader:
     async def _download_one(self, track: Track, album: Album, folder: str, base: str, *, cover: Optional[bytes],
                             total_tracks: int, label: str, requested_quality: Optional[int] = None) -> TrackResult:
         requested_quality = effective_quality(album, self.settings.quality) if requested_quality is None else requested_quality
-        result = TrackResult(track.id, track.full_title, requested_quality=requested_quality)
+        result = TrackResult(
+            track.id, track.full_title, requested_quality=requested_quality,
+            quality_reason=quality_request_reason(album, self.settings.quality, requested_quality),
+        )
         os.makedirs(folder, exist_ok=True)
         found = self._existing(folder, base)
         if found:
@@ -418,7 +441,8 @@ class Downloader:
                 raise NonStreamable("faixa indisponível na sua região/conta")
 
             def on_fallback(frm: str, to: str, why: Exception) -> None:
-                ui.warn(f"{label}: {frm} indisponível, tentando {to}")
+                result.fallback_steps.append((frm, to, str(why)))
+                ui.warn(f"{label}: {frm} indisponível ({why}), tentando {to}")
 
             stream = await resolve_stream(
                 self.api, track.id, requested_quality,
@@ -447,18 +471,25 @@ class Downloader:
                 async with self._lyrics_print_lock:
                     ui.step(f" 🔎 Procurando letras para: {label}...")
                 data = await self.api.get_lyrics(track.id)
-                lyrics_source = "Tidal"
-                if not data.get("lyrics") and not data.get("subtitles") and self.settings.lyrics_fallback:
-                    data = await lyr.fetch_lrclib_lyrics(self.api.http, track.artist_names, track.title, album.full_title)
-                    lyrics_source = "LRCLIB"
                 lyrics_plain, lrc = lyr.plain_lyrics(data), lyr.synced_lyrics(data)
+                lyrics_source = "Tidal" if lyrics_plain or lrc else ""
+                if not lyrics_source and self.settings.lyrics_fallback:
+                    data = await self._musixmatch.fetch(track.artist_names, track.title)
+                    lyrics_plain, lrc = lyr.plain_lyrics(data), lyr.synced_lyrics(data)
+                    lyrics_source = str(data.get("_source") or "") if lyrics_plain or lrc else ""
+                if not lyrics_source and self.settings.lyrics_fallback:
+                    data = await lyr.fetch_lrclib_lyrics(
+                        self.api.http, track.artist_names, track.title, album.full_title
+                    )
+                    lyrics_plain, lrc = lyr.plain_lyrics(data), lyr.synced_lyrics(data)
+                    lyrics_source = str(data.get("_source") or "LRCLIB") if lyrics_plain or lrc else ""
                 async with self._lyrics_print_lock:
                     if lrc:
                         ui.ok(f" └─ ✅ Letras sincronizadas encontradas ({lyrics_source})")
                     elif lyrics_plain:
                         ui.ok(f" └─ ✅ Letras (sem sincronia) encontradas ({lyrics_source})")
                     else:
-                        ui.warn(" └─ ⚠️ Nenhuma letra encontrada")
+                        ui.warn(" └─ ⚠️ Nenhuma letra encontrada (Tidal, Musixmatch e LRCLIB)")
 
             final = os.path.join(folder, truncate_name(base, OK_MAX_CHARACTER_LENGTH, f".{ext}") + f".{ext}")
             if ext in ("flac", "m4a"):
@@ -487,6 +518,17 @@ class Downloader:
             result.quality = stream.quality
             result.file_format = "EAC3" if is_dolby_codec(stream.codec) and "eac3" in stream.codec.lower() else ("AC4" if is_dolby_codec(stream.codec) else ("FLAC" if ext == "flac" else "AAC"))
             result.bit_depth, result.sample_rate = bit_depth, rate
+            actual_rank = QUALITY_BY_NAME.get((stream.quality or "").upper())
+            if actual_rank is not None and actual_rank < requested_quality:
+                chain = " → ".join([step[0] for step in result.fallback_steps] + [stream.quality])
+                result.quality_reason = (
+                    f"o playback não entregou o tier solicitado; caminho efetivo: {chain}"
+                )
+            elif requested_quality >= 4 and bit_depth is not None and bit_depth < 24:
+                result.quality_reason = (
+                    f"o manifesto respondeu HI_RES_LOSSLESS, mas informou {bit_depth} bits"
+                    + (f" e {rate / 1000:g} kHz" if rate else "")
+                )
             real_quality = format_real_quality(stream.codec, bit_depth, rate) or stream.quality
             ui.ok(f" └─ Concluído: {label} ({human_size(size)}, {result.file_format} {real_quality})")
         except FATAL:
@@ -532,19 +574,55 @@ class Downloader:
         skipped = sum(1 for track in result.tracks if track.skipped)
         failed = result.failed
         downloaded = sum(1 for track in result.tracks if track.success and not track.skipped)
-        lowered = sum(1 for track in result.tracks if track.success and not track.skipped
-                      and QUALITY_BY_NAME.get(track.quality, 9)
-                      < (track.requested_quality if track.requested_quality is not None else self.settings.quality))
+        lowered_tracks = [
+            track for track in result.tracks
+            if track.item_kind == "faixa" and track.success and not track.skipped
+            and QUALITY_BY_NAME.get(track.quality, 9)
+            < (track.requested_quality if track.requested_quality is not None else self.settings.quality)
+        ]
         ui.emit(f"\n{CYAN}{'-' * 44}{RESET}")
         ui.emit(f" 📊 RESUMO DA {kind}: {title}")
         ui.emit(f"Baixadas com sucesso : {GREEN}{downloaded}/{total}{RESET}")
         if skipped:
             ui.emit(f"Já existiam (puladas) : {YELLOW}{skipped}{RESET}")
-        if lowered:
-            ui.emit(f"Em qualidade menor (fallback) : {YELLOW}{lowered}{RESET}")
+        if lowered_tracks:
+            ui.emit(f"Ajuste automático de qualidade : {YELLOW}{len(lowered_tracks)} faixa(s){RESET}")
+        if result.tracks:
+            ui.emit("Itens:")
+            for track in result.tracks:
+                prefix = self._result_prefix(track)
+                if track.success:
+                    if track.item_kind == "vídeo":
+                        delivered = f"{track.quality or '?'} / {track.file_format or '?'}"
+                        ui.emit(f"  • {prefix} {track.title}: entregue {delivered}")
+                    else:
+                        delivered = format_real_quality("", track.bit_depth, track.sample_rate) or track.quality
+                        requested = track.requested_quality if track.requested_quality is not None else self.settings.quality
+                        wanted = QUALITY_LABELS.get(requested, QUALITY_MAP.get(requested, "?"))
+                        ui.emit(f"  • {prefix} {track.title}: alvo {wanted} → entregue {delivered}")
+                    if track.quality_reason:
+                        ui.emit(f"      motivo: {track.quality_reason}")
+                    for frm, to, why in track.fallback_steps:
+                        ui.emit(f"      {frm} → {to}: {why}")
+                elif track.error:
+                    ui.emit(f"  • {prefix} {track.title}: falhou — {track.error}")
+        real_qualities = sorted({
+            format_real_quality("", track.bit_depth, track.sample_rate)
+            for track in result.tracks
+            if track.success and not track.skipped and track.item_kind == "faixa"
+            and (track.bit_depth or track.sample_rate)
+        })
+        if real_qualities:
+            ui.emit(f"Qualidade real das faixas: {', '.join(real_qualities)}")
         if failed:
             ui.emit(f"Falhas : {RED}{failed}{RESET}")
         ui.emit(f"{CYAN}{'-' * 44}{RESET}\n")
+
+    @staticmethod
+    def _result_prefix(track: TrackResult) -> str:
+        if track.item_index and track.item_total:
+            return f"[{track.item_kind} {track.item_index:02d}/{track.item_total:02d}]"
+        return f"[{track.item_kind}]"
 
     async def download_album(self, album_id: Any) -> AlbumResult:
         album, tracks, videos = await self.api.get_album_with_items(album_id)
@@ -567,8 +645,14 @@ class Downloader:
                        ("Ano", album.year), ("Faixas", str(len(tracks) or album.number_of_tracks))]
         if videos:
             header_rows.append(("Vídeos", str(len(videos))))
-        header_rows += [("Qualidade alvo", QUALITY_LABELS.get(album_quality, QUALITY_MAP[album_quality])),
-                        ("Modo", mode)]
+        catalog_quality = album.max_quality_rank
+        header_rows += [
+            ("Qualidade configurada", QUALITY_LABELS.get(self.settings.quality, QUALITY_MAP[self.settings.quality])),
+            ("Limite informado pelo catálogo",
+             QUALITY_LABELS.get(catalog_quality, "não informado") if catalog_quality is not None else "não informado"),
+            ("Qualidade alvo", QUALITY_LABELS.get(album_quality, QUALITY_MAP[album_quality])),
+            ("Modo", mode),
+        ]
         ui.header("ÁLBUM", header_rows)
         if not tracks and not videos:
             ui.warn("Álbum sem faixas disponíveis.")
@@ -590,7 +674,8 @@ class Downloader:
                                            requested_quality=album_quality))
         for index, video in enumerate(videos, start=1):
             jobs.append(self._download_video_one(
-                video, video_dir, label=f"[vídeo {index}/{len(videos)}] {video.full_title}"
+                video, video_dir, album=album, cover=cover,
+                label=f"[vídeo {index}/{len(videos)}] {video.full_title}"
             ))
         try:
             with progress.sigint_guard():
@@ -624,15 +709,11 @@ class Downloader:
         for track in result.tracks:
             if track.path.startswith(work):
                 track.path = final + track.path[len(work):]
+        for index, track in enumerate(result.tracks[:len(tracks)], start=1):
+            track.item_kind, track.item_index, track.item_total = "faixa", index, len(tracks)
+        for index, video_result in enumerate(result.tracks[len(tracks):], start=1):
+            video_result.item_kind, video_result.item_index, video_result.item_total = "vídeo", index, len(videos)
         self._print_summary("ÁLBUM", album.full_title, result)
-        real_qualities = sorted({
-            format_real_quality("", track.bit_depth, track.sample_rate)
-            for track in result.tracks
-            if track.success and not track.skipped and track.file_format not in ("EAC3", "AC4")
-            and (track.bit_depth or track.sample_rate)
-        })
-        if real_qualities:
-            ui.emit(f"Qualidade real das faixas: {', '.join(real_qualities)}")
         if ok:
             await self._record_album(album, result, final)
         else:
@@ -687,6 +768,7 @@ class Downloader:
                                               label=f"{track.artist_names} - {track.full_title}",
                                               requested_quality=track_quality)
         result.tracks = [single]
+        single.item_kind, single.item_index, single.item_total = "faixa", 1, 1
         if single.success and not single.skipped and self.db_path:
             await dbm.a_mark_downloaded(self.db_path, track.id, "track",
                                         quality=QUALITY_BY_NAME.get(single.quality, self.settings.quality),
@@ -721,11 +803,19 @@ class Downloader:
 
         with progress.sigint_guard():
             result.tracks = await run_limited([one(index, item) for index, item in enumerate(tracks, start=1)], self._workers)
+        for index, track_result in enumerate(result.tracks, start=1):
+            track_result.item_kind, track_result.item_index, track_result.item_total = "faixa", index, len(tracks)
         self._print_summary("PLAYLIST", playlist.title, result)
         paths = [os.path.relpath(track.path, folder) for track in result.tracks if track.success and track.path]
         if paths:
-            with open(os.path.join(folder, sanitize_component(playlist.title) + ".m3u8"), "w", encoding="utf-8") as fh:
-                fh.write("#EXTM3U\n" + "\n".join(paths) + "\n")
+            playlist_name = sanitize_component(playlist.title)
+            content = "#EXTM3U\n" + "\n".join(paths) + "\n"
+            # .m3u é o formato portátil esperado por players e servidores;
+            # .m3u8 continua sendo escrito como compatibilidade com versões
+            # anteriores que já geraram esse nome.
+            for extension in (".m3u", ".m3u8"):
+                with open(os.path.join(folder, playlist_name + extension), "w", encoding="utf-8") as fh:
+                    fh.write(content)
         return result
 
     async def _ffmpeg_remux_generic(self, src: str, dst: str, *, extra: list[str] = ()) -> bool:
@@ -762,7 +852,10 @@ class Downloader:
         year = f" ({video.year})" if video.release_date else ""
         return sanitize_component(f"{video.artist_names} - {video.full_title}{year}")
 
-    async def _download_video_one(self, video: Video, dest_dir: str, *, label: Optional[str] = None) -> TrackResult:
+    async def _download_video_one(
+        self, video: Video, dest_dir: str, *, album: Optional[Album] = None,
+        cover: Optional[bytes] = None, label: Optional[str] = None
+    ) -> TrackResult:
         os.makedirs(dest_dir, exist_ok=True)
         base = self.video_filename(video)
         label = label or f"{video.artist_names} - {video.full_title}"
@@ -807,6 +900,23 @@ class Downloader:
             else:
                 os.replace(tmp, final)
 
+            if final.endswith(".mp4"):
+                try:
+                    await asyncio.to_thread(metadata.tag_video_file, final, video, album=album, cover=cover)
+                except Exception as exc:
+                    ui.warn(f"{label}: vídeo salvo, mas não foi possível gravar tags ({exc})")
+            else:
+                # TS não oferece um contêiner de metadados comparável ao MP4.
+                # O sidecar mantém as informações sem reencodar o vídeo.
+                sidecar = {
+                    "title": video.full_title, "artist": video.artist_names,
+                    "album": album.full_title if album else "",
+                    "album_artist": album.album_artist if album else "",
+                    "release_date": album.release_date if album else video.release_date,
+                    "tidal_video_id": video.id,
+                }
+                with open(final + ".json", "w", encoding="utf-8") as fh:
+                    json.dump(sidecar, fh, ensure_ascii=False, indent=2)
             result.success = True
             result.path = final
             result.quality = self.settings.video_quality
@@ -843,5 +953,6 @@ class Downloader:
         track_result = await self._download_video_one(video, video_dir)
         result.tracks = [track_result]
         result.skipped = track_result.skipped
+        track_result.item_kind, track_result.item_index, track_result.item_total = "vídeo", 1, 1
         self._print_summary("VÍDEO", video.full_title, result)
         return result

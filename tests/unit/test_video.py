@@ -50,6 +50,8 @@ def test_download_video_completo(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "VÍDEO" in out and "Em Progresso: Artist - Music Video" in out
     assert "└─ Concluído: Artist - Music Video" in out and "RESUMO DA VÍDEO" in out
+    assert "[vídeo 01/01] Music Video" in out
+    assert os.path.isfile(path + ".json")  # TS não suporta tags nativas
     assert db.is_downloaded(str(tmp_path / "t.db"), 99, "video") == path
     # sentinela é só para álbuns; vídeo não deve criar uma
     assert not sentinel.has_sentinel(os.path.dirname(path))

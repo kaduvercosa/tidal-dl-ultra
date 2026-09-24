@@ -29,7 +29,8 @@ from tidal_dl.utils import clean_leftovers, get_config_paths
 
 OFFLINE = {
     "doctor": "doctor", "check": "doctor", "scan": "scan", "library-scan": "scan",
-    "library": "library", "lib": "library", "stats": "stats", "config": "config",
+    "library": "library", "lib": "library", "stats": "stats", "lyrics": "lyrics",
+    "inspect": "inspect", "config": "config",
     "logout": "logout",
 }
 SYNC = {"sync-favorites", "sf"}
@@ -321,6 +322,14 @@ async def async_main(argv: Optional[list[str]] = None) -> int:
                 return cmd_stats(paths)
             if kind == "config":
                 return await cmd_config(args, paths)
+            if kind == "lyrics":
+                from tidal_dl.lyrics_cmd import cmd_lyrics
+
+                return await cmd_lyrics(args, directory=directory)
+            if kind == "inspect":
+                from tidal_dl.inspect_cmd import cmd_inspect
+
+                return await cmd_inspect(args, directory=directory)
             from tidal_dl import doctor
             from tidal_dl.library_cmd import cmd_library, cmd_scan
 

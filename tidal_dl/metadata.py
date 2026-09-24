@@ -11,7 +11,7 @@ import logging
 import os
 from typing import Any, Optional
 
-from tidal_dl.models import Album, Stream, Track
+from tidal_dl.models import Album, Stream, Track, Video
 
 logger = logging.getLogger(__name__)
 
@@ -147,3 +147,32 @@ def tag_file(path: str, tags: dict[str, str], cover: Optional[bytes] = None) -> 
         tag_m4a(path, tags, cover)
     else:
         raise ValueError(f"extensão sem suporte a tags: {ext}")
+
+
+def tag_video_file(path: str, video: Video, *, album: Optional[Album] = None,
+                   cover: Optional[bytes] = None) -> None:
+    """Preenche metadados básicos do vídeo no contêiner MP4.
+
+    MPEG-TS não possui um padrão de tags equivalente; nesse caso o downloader
+    mantém o arquivo e grava um sidecar JSON. MP4 recebe tags nativas que
+    players de iOS, macOS e bibliotecas de mídia reconhecem.
+    """
+    from mutagen.mp4 import MP4, MP4Cover, MP4FreeForm  # noqa: PLC0415
+
+    audio = MP4(path)
+    audio["\xa9nam"] = [video.full_title]
+    audio["\xa9ART"] = [video.artist_names]
+    if album:
+        audio["\xa9alb"] = [album.full_title]
+        audio["aART"] = [album.album_artist]
+        if album.release_date:
+            audio["\xa9day"] = [album.release_date]
+        if album.copyright:
+            audio["cprt"] = [album.copyright]
+    audio["----:com.apple.iTunes:TIDALVIDEOID"] = [MP4FreeForm(str(video.id).encode("utf-8"))]
+    if video.explicit:
+        audio["rtng"] = [1]
+    if cover:
+        fmt = MP4Cover.FORMAT_PNG if image_mime(cover) == "image/png" else MP4Cover.FORMAT_JPEG
+        audio["covr"] = [MP4Cover(cover, imageformat=fmt)]
+    audio.save()

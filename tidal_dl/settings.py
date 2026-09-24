@@ -47,7 +47,7 @@ class TidalDLSettings:
     save_cover_file: bool = True  # cover.jpg na pasta do álbum
     cover_size: int = 1280
     lyrics: bool = True  # embute letra
-    lyrics_fallback: bool = True  # busca no LRCLIB quando o Tidal não tem a letra
+    lyrics_fallback: bool = True  # tenta Musixmatch e depois LRCLIB quando o Tidal não tem a letra
     save_lrc: bool = True  # grava .lrc quando há letra sincronizada
     no_database: bool = False
     write_sentinel: bool = True

@@ -28,7 +28,7 @@ import logging
 import xml.etree.ElementTree as ET
 from typing import Any, Optional
 
-from tidal_dl.constants import QUALITY_MAP
+from tidal_dl.constants import QUALITY_BY_NAME, QUALITY_MAP
 from tidal_dl.exceptions import (
     ForbiddenError,
     InvalidQuality,
@@ -186,7 +186,13 @@ async def resolve_stream(
         name = QUALITY_MAP[rank]
         try:
             info = await api.playback_info(track_id, name)
-            return stream_from_playback(info, track_id)
+            stream = stream_from_playback(info, track_id)
+            returned_rank = QUALITY_BY_NAME.get((stream.quality or "").upper())
+            if returned_rank is not None and returned_rank < rank:
+                raise QualityUnavailable(
+                    f"tier {name} devolveu {stream.quality}, abaixo do solicitado"
+                )
+            return stream
         except PreviewOnly:
             raise  # descer de qualidade não resolve prévia
         except (ForbiddenError, NonStreamable) as exc:

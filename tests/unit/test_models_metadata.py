@@ -82,6 +82,7 @@ def test_lyrics():
 # ---------------------------------------------------------------------------
 
 import asyncio  # noqa: E402
+import json  # noqa: E402
 
 from fakes import jresp, make_client  # noqa: E402
 
@@ -142,3 +143,53 @@ def test_lrclib_nunca_levanta():
 def test_lrclib_resposta_nao_e_objeto():
     client, _ = make_client(lambda *a: jresp([1, 2, 3]))
     assert _run(ly.fetch_lrclib_lyrics(client, "A", "T")) == {}
+
+
+def test_musixmatch_busca_token_e_letra_lrc():
+    def handler(method, url, params, data, headers):
+        if url == ly.MXM_TOKEN_URL:
+            return jresp({"message": {"header": {"status_code": 200},
+                                      "body": {"user_token": "temporary"}}})
+        assert url == ly.MXM_SUBTITLES_URL
+        assert params["q_artist"] == "Artista" and params["q_track"] == "Musica"
+        return jresp({
+            "message": {
+                "header": {"status_code": 200},
+                "body": {
+                    "macro_calls": {
+                        "track.subtitles.get": {
+                            "message": {
+                                "header": {"status_code": 200},
+                                "body": {"subtitle_list": [{
+                                    "subtitle": {"subtitle_body": "[00:01.00] la la"}
+                                }]},
+                            }
+                        }
+                    }
+                },
+            }
+        })
+
+    client, _ = make_client(handler)
+    data = _run(ly.fetch_musixmatch_lyrics(client, "Artista", "Musica"))
+    assert data["lyrics"] == "la la"
+    assert data["subtitles"] == "[00:01.00] la la"
+    assert data["_source"] == "Musixmatch"
+
+
+def test_musixmatch_normaliza_richsync_json():
+    raw = json.dumps([
+        {"text": "primeira", "time": {"total": 1.25}},
+        {"text": "segunda", "time": {"total": 3.5}},
+    ])
+    plain, lrc = ly._musixmatch_body_to_text(raw)
+    assert plain == "primeira\nsegunda"
+    assert lrc == "[00:01.250] primeira\n[00:03.500] segunda"
+
+
+def test_musixmatch_resposta_captcha_nao_derruba():
+    def handler(method, url, params, data, headers):
+        return jresp({"message": {"header": {"status_code": 401}}}, 401)
+
+    client, _ = make_client(handler)
+    assert _run(ly.fetch_musixmatch_lyrics(client, "A", "T")) == {}

@@ -40,6 +40,15 @@ def test_album_usa_o_maximo_publicado_sem_fallback_artificial(tmp_path):
     assert res.folder.endswith("[FLAC 16]")
 
 
+def test_resumo_explicita_limite_do_catalogo_e_indice(tmp_path, capsys):
+    sc = Scenario(tmp_path, quality="LOSSLESS")
+    run(sc.downloader().download_album(10))
+    out = capsys.readouterr().out
+    assert "limite informado pelo catálogo" in out.lower()
+    assert "[faixa 01/02] Song1" in out
+    assert "catálogo informou" in out
+
+
 def test_video_de_album_tem_raiz_separada_mesmo_com_configuracao_antiga(tmp_path):
     sc = Scenario(tmp_path)
     sc.settings.video_directory = sc.settings.directory
@@ -366,7 +375,8 @@ def test_resumo_mostra_puladas_falhas_e_fallback(tmp_path, capsys):
     run(sc.downloader().download_album(10))
     out = capsys.readouterr().out
     assert "Baixadas com sucesso : " in out and "1/2" in out
-    assert "Em qualidade menor (fallback) : " in out and "Falhas : " in out
+    assert "Ajuste automático de qualidade : " in out
+    assert "alvo" in out and "entregue" in out and "Falhas : " in out
 
 
 def test_abort_por_ctrl_c_limpa_temporarios(tmp_path):
