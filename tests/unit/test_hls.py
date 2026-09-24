@@ -105,6 +105,7 @@ def test_fmp4_detectado_por_ext_x_map_e_por_extensao():
 
 
 def test_decrypt_aes128_round_trip_com_cryptography():
+    pytest.importorskip("cryptography")
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     from cryptography.hazmat.primitives import padding as _padding
 
@@ -171,6 +172,7 @@ def test_download_hls_com_master_seleciona_variante(tmp_path):
 
 def test_download_hls_decripta_segmentos(tmp_path):
     from fakes import jresp
+    pytest.importorskip("cryptography")
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     from cryptography.hazmat.primitives import padding as _padding
 
@@ -234,8 +236,6 @@ def test_download_hls_segmento_ausente_e_erro_permanente(tmp_path):
 
 def test_download_hls_retry_em_falha_de_rede(tmp_path):
     from fakes import jresp
-
-    calls = {"n": 0}
 
     def handler(method, url, params, data, headers):
         return jresp({}, 404)

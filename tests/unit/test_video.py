@@ -132,6 +132,7 @@ def test_download_video_com_master_playlist_e_qualidade(tmp_path):
 
 def test_download_video_segmentos_criptografados(tmp_path):
     import os as _os
+    pytest.importorskip("cryptography")
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     from cryptography.hazmat.primitives import padding as _padding
 
