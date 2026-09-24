@@ -250,8 +250,9 @@ async def run_online(command: str, args, settings: TidalDLSettings, paths: dict)
         raise TidalDLException(f"comando desconhecido: {command}")
     finally:
         await tidal.aclose()
-        if os.path.isdir(settings.directory):
-            clean_leftovers(settings.directory, TMP_PREFIX)
+        for root in {settings.directory, settings.video_directory}:
+            if os.path.isdir(root):
+                clean_leftovers(root, TMP_PREFIX)
 
 
 async def async_main(argv: Optional[list[str]] = None) -> int:

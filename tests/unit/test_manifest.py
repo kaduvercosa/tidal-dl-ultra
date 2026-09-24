@@ -7,7 +7,14 @@ import pytest
 
 from fakes import b64, dash_mpd
 from tidal_dl import manifest as m
-from tidal_dl.exceptions import ForbiddenError, InvalidQuality, NonStreamable, PreviewOnly, UnsupportedProtection
+from tidal_dl.exceptions import (
+    ForbiddenError,
+    InvalidQuality,
+    ManifestError,
+    NonStreamable,
+    PreviewOnly,
+    UnsupportedProtection,
+)
 
 
 def run(c):
@@ -123,3 +130,16 @@ def test_resolve_403_em_todas_vira_nonstreamable():
     api = FakeAPI({q: ForbiddenError("x") for q in ("LOW", "HIGH")})
     with pytest.raises(NonStreamable):
         run(m.resolve_stream(api, 1, 1))
+
+
+def test_manifesto_ilegivel_nao_faz_fallback():
+    """Falha do parser não pode ser confundida com tier indisponível."""
+    api = FakeAPI({
+        "HI_RES_LOSSLESS": {"manifestMimeType": "application/vnd.tidal.bts",
+                            "audioQuality": "HI_RES_LOSSLESS",
+                            "assetPresentation": "FULL", "manifest": "!!!"},
+        "HI_RES": bts(),
+    })
+    with pytest.raises(ManifestError):
+        run(m.resolve_stream(api, 1, 4))
+    assert api.asked == ["HI_RES_LOSSLESS"]

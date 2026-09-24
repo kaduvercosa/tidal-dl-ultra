@@ -73,6 +73,7 @@ class TrackResult:
     file_format: str = ""
     bit_depth: Optional[int] = None
     sample_rate: Optional[int] = None
+    requested_quality: Optional[int] = None
 
 
 @dataclass
@@ -123,6 +124,18 @@ def quality_fields(album_quality: str, cfg_quality: int) -> tuple[str, Optional[
     return "FLAC", 24, ""
 
 
+def effective_quality(album: Album, configured: int) -> int:
+    """Tier que deve ser pedido para uma faixa deste álbum.
+
+    O ``audioQuality`` do álbum é o limite publicado pelo catálogo. Respeitá-lo
+    antes de chamar playback evita pedir um tier que a API já declarou
+    indisponível e chamar a resposta esperada de fallback.
+    """
+    configured = max(0, min(int(configured), 4))
+    maximum = album.max_quality_rank
+    return min(configured, maximum) if maximum is not None else configured
+
+
 async def run_limited(coros: list, limit: int) -> list:
     sem = asyncio.Semaphore(max(1, limit))
 
@@ -154,6 +167,18 @@ class Downloader:
         self._parallel = False
         self._workers = 1
         self._lyrics_print_lock = asyncio.Lock()
+
+    def _video_root(self) -> str:
+        """Mantém vídeo fora da árvore que o player de música indexa."""
+        root = os.path.expanduser(self.settings.video_directory)
+        music = os.path.abspath(os.path.expanduser(self.settings.directory))
+        # Uma configuração antiga pode apontar as duas opções para o mesmo
+        # lugar; ainda assim, não misture extensões de vídeo com os álbuns.
+        return os.path.join(root, "Videos") if os.path.abspath(root) == music else root
+
+    def album_video_folder(self, album: Album) -> str:
+        name = sanitize_component(f"{album.album_artist} - {album.full_title} ({album.year})")
+        return os.path.join(self._video_root(), "Albums", name)
 
     async def _fetch_bytes(self, url: str) -> Optional[bytes]:
         try:
@@ -375,8 +400,9 @@ class Downloader:
         return None
 
     async def _download_one(self, track: Track, album: Album, folder: str, base: str, *, cover: Optional[bytes],
-                            total_tracks: int, label: str) -> TrackResult:
-        result = TrackResult(track.id, track.full_title)
+                            total_tracks: int, label: str, requested_quality: Optional[int] = None) -> TrackResult:
+        requested_quality = effective_quality(album, self.settings.quality) if requested_quality is None else requested_quality
+        result = TrackResult(track.id, track.full_title, requested_quality=requested_quality)
         os.makedirs(folder, exist_ok=True)
         found = self._existing(folder, base)
         if found:
@@ -395,7 +421,7 @@ class Downloader:
                 ui.warn(f"{label}: {frm} indisponível, tentando {to}")
 
             stream = await resolve_stream(
-                self.api, track.id, self.settings.quality,
+                self.api, track.id, requested_quality,
                 allow_fallback=self.settings.allow_quality_fallback, on_fallback=on_fallback,
                 preferred_tier=DOLBY_ATMOS_TIER if track.audio_quality.upper() == DOLBY_ATMOS_TIER else None,
             )
@@ -507,7 +533,8 @@ class Downloader:
         failed = result.failed
         downloaded = sum(1 for track in result.tracks if track.success and not track.skipped)
         lowered = sum(1 for track in result.tracks if track.success and not track.skipped
-                      and QUALITY_BY_NAME.get(track.quality, 9) < self.settings.quality)
+                      and QUALITY_BY_NAME.get(track.quality, 9)
+                      < (track.requested_quality if track.requested_quality is not None else self.settings.quality))
         ui.emit(f"\n{CYAN}{'-' * 44}{RESET}")
         ui.emit(f" 📊 RESUMO DA {kind}: {title}")
         ui.emit(f"Baixadas com sucesso : {GREEN}{downloaded}/{total}{RESET}")
@@ -523,10 +550,11 @@ class Downloader:
         album, tracks, videos = await self.api.get_album_with_items(album_id)
         self._album_cache[album.id] = album
         result = AlbumResult(album.id, album.full_title, album.album_artist)
+        album_quality = effective_quality(album, self.settings.quality)
         final_dir = self.album_folder(album)
         result.folder = final_dir
         if self.db_path:
-            prev = await dbm.a_is_downloaded(self.db_path, album.id, "album", self.settings.quality)
+            prev = await dbm.a_is_downloaded(self.db_path, album.id, "album", album_quality)
             if prev is not None:
                 ui.skip(f"{album.album_artist} - {album.full_title}: já baixado ({prev or 'sem caminho'})")
                 result.skipped = True
@@ -539,7 +567,7 @@ class Downloader:
                        ("Ano", album.year), ("Faixas", str(len(tracks) or album.number_of_tracks))]
         if videos:
             header_rows.append(("Vídeos", str(len(videos))))
-        header_rows += [("Qualidade alvo", QUALITY_LABELS.get(self.settings.quality, QUALITY_MAP[self.settings.quality])),
+        header_rows += [("Qualidade alvo", QUALITY_LABELS.get(album_quality, QUALITY_MAP[album_quality])),
                         ("Modo", mode)]
         ui.header("ÁLBUM", header_rows)
         if not tracks and not videos:
@@ -552,14 +580,18 @@ class Downloader:
             with open(os.path.join(work, "cover.jpg"), "wb") as fh:
                 fh.write(cover)
         total = len(tracks)
+        video_dir = self.album_video_folder(album)
         jobs = []
         for index, track in enumerate(tracks, start=1):
             base = self.track_basename(track, album, multi_disc=multi)
             sub = os.path.join(work, f"CD {track.volume_number:02d}") if multi else work
             jobs.append(self._download_one(track, album, sub, base, cover=cover, total_tracks=total,
-                                           label=f"[{index}/{total}] {track.full_title}"))
+                                           label=f"[{index}/{total}] {track.full_title}",
+                                           requested_quality=album_quality))
         for index, video in enumerate(videos, start=1):
-            jobs.append(self._download_video_one(video, work, label=f"[vídeo {index}/{len(videos)}] {video.full_title}"))
+            jobs.append(self._download_video_one(
+                video, video_dir, label=f"[vídeo {index}/{len(videos)}] {video.full_title}"
+            ))
         try:
             with progress.sigint_guard():
                 result.tracks = await run_limited(jobs, self._workers)
@@ -570,6 +602,11 @@ class Downloader:
                 for filename in files:
                     if filename.startswith(TMP_PREFIX):
                         remove_quiet(os.path.join(root, filename))
+            if os.path.isdir(self._video_root()):
+                for root, _dirs, files in os.walk(self._video_root()):
+                    for filename in files:
+                        if filename.startswith(TMP_PREFIX):
+                            remove_quiet(os.path.join(root, filename))
             raise
 
         ok = result.failed == 0
@@ -588,6 +625,14 @@ class Downloader:
             if track.path.startswith(work):
                 track.path = final + track.path[len(work):]
         self._print_summary("ÁLBUM", album.full_title, result)
+        real_qualities = sorted({
+            format_real_quality("", track.bit_depth, track.sample_rate)
+            for track in result.tracks
+            if track.success and not track.skipped and track.file_format not in ("EAC3", "AC4")
+            and (track.bit_depth or track.sample_rate)
+        })
+        if real_qualities:
+            ui.emit(f"Qualidade real das faixas: {', '.join(real_qualities)}")
         if ok:
             await self._record_album(album, result, final)
         else:
@@ -620,8 +665,9 @@ class Downloader:
         track = await self.api.get_track(track_id)
         album = await self._album_for(track)
         result = AlbumResult(track.album_id, album.full_title, album.album_artist)
+        track_quality = effective_quality(album, self.settings.quality)
         if self.db_path:
-            previous = await dbm.a_is_downloaded(self.db_path, track.id, "track", self.settings.quality)
+            previous = await dbm.a_is_downloaded(self.db_path, track.id, "track", track_quality)
             if previous:
                 ui.skip(f"{track.artist_names} - {track.full_title}: já baixada")
                 result.skipped = True
@@ -638,7 +684,8 @@ class Downloader:
         with progress.sigint_guard():
             single = await self._download_one(track, album, sub, base, cover=cover,
                                               total_tracks=album.number_of_tracks,
-                                              label=f"{track.artist_names} - {track.full_title}")
+                                              label=f"{track.artist_names} - {track.full_title}",
+                                              requested_quality=track_quality)
         result.tracks = [single]
         if single.success and not single.skipped and self.db_path:
             await dbm.a_mark_downloaded(self.db_path, track.id, "track",
@@ -786,7 +833,7 @@ class Downloader:
     async def download_video(self, video_id: Any) -> AlbumResult:
         video = await self.api.get_video(video_id)
         result = AlbumResult(video.id, video.full_title, video.artist_names)
-        video_dir = self.settings.video_directory
+        video_dir = self._video_root()
         os.makedirs(video_dir, exist_ok=True)
         result.folder = video_dir
         mode = self._configure_mode(1)

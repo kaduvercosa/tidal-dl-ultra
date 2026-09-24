@@ -7,8 +7,9 @@ import pytest
 
 from scenario import Scenario
 from tidal_dl import db, sentinel
-from tidal_dl.downloader import quality_fields, run_limited
+from tidal_dl.downloader import effective_quality, quality_fields, run_limited
 from tidal_dl.exceptions import AuthenticationError
+from tidal_dl.models import Album, Artist
 
 
 def run(c):
@@ -28,6 +29,26 @@ def test_quality_fields():
     assert quality_fields("HI_RES_LOSSLESS", 1) == ("AAC", 16, "44.1")
     assert quality_fields("LOSSLESS", 4) == ("FLAC", 16, "44.1")  # álbum limita o pedido
     assert quality_fields("", 3)[0] == "FLAC"
+
+
+def test_album_usa_o_maximo_publicado_sem_fallback_artificial(tmp_path):
+    sc = Scenario(tmp_path, quality="LOSSLESS")
+    res = run(sc.downloader().download_album(10))
+    assert res.ok
+    assert effective_quality(Album(10, "Alb", artist=Artist(), audio_quality="LOSSLESS"), 4) == 2
+    assert all(tier == "LOSSLESS" for _tid, tier in sc.asked)
+    assert res.folder.endswith("[FLAC 16]")
+
+
+def test_video_de_album_tem_raiz_separada_mesmo_com_configuracao_antiga(tmp_path):
+    sc = Scenario(tmp_path)
+    sc.settings.video_directory = sc.settings.directory
+    dl = sc.downloader()
+    album = Album(10, "Alb", artist=Artist(name="Art"), release_date="2020-01-02")
+    video_folder = dl.album_video_folder(album)
+    assert video_folder.startswith(os.path.join(sc.settings.directory, "Videos"))
+    assert os.path.commonpath((video_folder, sc.settings.directory)) == sc.settings.directory
+    assert os.path.commonpath((video_folder, sc.settings.directory)) != video_folder
 
 
 def test_album_completo(tmp_path):

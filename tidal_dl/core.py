@@ -798,7 +798,7 @@ class TidalDL:
     # ==========================================================================
     # Modo interativo completo (estilo qobuz-dl-ultra): tela de TIPO -> tela de
     # TERMO (ou Favoritos) -> tabela de RESULTADOS, cada etapa separada, com
-    # loop pra buscar de novo sem sair do programa. `interactive()` acima
+    # fluxo de uma busca por invocação. `interactive()` acima
     # continua existindo pra uso direto/scriptável (`search -t album termo`);
     # isso aqui é só pro `search`/`i`/`fun` chamado SEM argumentos.
     # ==========================================================================
@@ -829,6 +829,9 @@ class TidalDL:
             else:
                 ok = await self._interactive_search_loop(self._TYPE_MENU[choice])
             any_ok = any_ok or ok
+            # Uma invocação interativa executa uma seleção/download. Não
+            # reabra automaticamente o menu depois que a operação terminou.
+            return any_ok
 
     async def _interactive_favorites_menu(self) -> bool:
         """Sub-tela: escolhe QUAL favorito (álbum/faixa/artista/playlist),
@@ -854,9 +857,10 @@ class TidalDL:
         return await self._select_and_download(f"MEUS FAVORITOS: {choice}", kind, raw_items)
 
     async def _interactive_search_loop(self, kind: str) -> bool:
-        """Pede o termo (tela própria, com prompt_toolkit) em loop até
-        Ctrl+C/Esc/linha vazia duas vezes seguidas -- cada busca bem-sucedida
-        mostra a tabela de resultados na sequência.
+        """Pede o termo e executa uma seleção nesta invocação.
+
+        Ctrl+C/Esc cancela a tela atual; depois de uma seleção/download o
+        controle volta ao chamador, em vez de reabrir o menu interativo.
         """
         session = PromptSession()
         rotulo = {"album": "álbuns", "track": "faixas", "artist": "artistas", "playlist": "playlists"}[kind]
@@ -881,6 +885,7 @@ class TidalDL:
                 continue
             ok = await self._select_and_download(f"RESULTADOS: {query}", kind, items)
             any_ok = any_ok or ok
+            return any_ok
 
     async def _select_and_download(self, title: str, kind: str, raw_items: list[dict]) -> bool:
         """Tabela de seleção (múltipla) a partir de uma lista já buscada

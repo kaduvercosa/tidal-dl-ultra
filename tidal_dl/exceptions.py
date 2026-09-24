@@ -38,6 +38,19 @@ class NonStreamable(TidalDLException):
     """A faixa existe mas não pode ser baixada (região, restrição, sem URL)."""
 
 
+class ManifestError(NonStreamable):
+    """O serviço respondeu, mas o manifesto veio inválido ou ilegível.
+
+    Este erro não significa que a qualidade pedida não esteja disponível:
+    fazer fallback aqui apenas esconderia uma falha de API/parser e salvaria
+    uma faixa em qualidade diferente da solicitada.
+    """
+
+
+class QualityUnavailable(NonStreamable):
+    """A API confirmou que não há stream utilizável neste tier."""
+
+
 class PreviewOnly(NonStreamable):
     """Só a prévia (30 s) está disponível: assinatura inativa/insuficiente."""
 
@@ -45,7 +58,8 @@ class PreviewOnly(NonStreamable):
 class UnsupportedProtection(NonStreamable):
     """O stream veio protegido por criptografia, que este projeto NÃO suporta.
 
-    O downloader tenta uma qualidade menor (sem proteção) antes de desistir.
+    O downloader pode tentar uma qualidade menor (sem proteção) antes de
+    desistir, pois este stream não é utilizável pelo projeto.
     """
 
 

@@ -21,13 +21,13 @@ Irmão do **qobuz-dl-ultra**: mesma organização de código, mesma pasta/nome d
 
 ## ✨ Funcionalidades
 
-* **Lossless e Hi-Res** (FLAC até 24-bit/192 kHz conforme o plano) e AAC. Se a qualidade pedida não existir para uma faixa, o programa **desce um degrau por vez** até uma que sirva (`--no-fallback` desliga).
+* **Lossless e Hi-Res** (FLAC até 24-bit/192 kHz conforme o plano) e AAC. O programa respeita o máximo publicado pelo álbum e mostra a qualidade real de cada faixa (por exemplo, `24bit/48kHz`). Só desce um degrau quando a API confirma que o tier está indisponível (`--no-fallback` desliga); falha de rede, autenticação, rate limit ou manifesto inválido não vira fallback silencioso.
 * **Python puro, sem ffmpeg obrigatório.** O Tidal entrega Hi-Res como DASH (FLAC dentro de MP4 fragmentado); o remux para FLAC nativo é feito em Python (`fmp4.py`), sem re-encode. ffmpeg é só plano B.
 * **Funciona no a-Shell**: núcleo com `httpx`, `mutagen` e `colorama` (todos Python puro), sem keyring (token em arquivo `0600`), sem `aiosqlite`/`tenacity`/`tqdm`, saída adaptada a tela estreita.
 * **Tags completas**: título/artista/álbum, faixa/disco, data, ISRC, `BARCODE` (UPC), copyright, BPM, **ReplayGain de faixa e álbum**, capa, letra e IDs do Tidal (`TIDALTRACKID`, `TIDALALBUMID`) — os IDs permitem ao `scan` reconhecer seus álbuns com certeza. FLAC e M4A.
 * **Letras**: embutidas nas tags e, quando sincronizadas, também em `.lrc`.
 * **Retomada inteligente**: pasta `[IN PROGRESS]` durante o download; se algo falha vira `[INCOMPLETE]` e a próxima execução só baixa o que faltou. Arquivos temporários usam `~tmp_` (sem ponto, para o app Arquivos do iOS).
-* **Álbuns, faixas, playlists (com `.m3u8`), artistas e vídeos musicais**, multi-disco em `CD 01`, `CD 02`.
+* **Álbuns, faixas, playlists (com `.m3u8`), artistas e vídeos musicais**, multi-disco em `CD 01`, `CD 02`. Vídeos associados a álbuns ficam em `video_directory/Albums/...`, fora da árvore de músicas.
 * **Vídeo (HLS)**: escolhe a variante pela qualidade (`--video-quality low/medium/high`), decripta segmentos AES-128 quando o CDN usa (mecanismo padrão do próprio HLS, não é DRM), remux para `.mp4` via ffmpeg quando disponível — sem ffmpeg, fica um `.ts` (toca normalmente no VLC e na maioria dos players).
 * **Letras com reforço**: usa a letra do Tidal quando existe; se não existir, busca no [LRCLIB](https://lrclib.net) (banco aberto e gratuito de letras) antes de desistir — sempre de forma assíncrona, sem travar outros downloads. Desative com `--no-lyrics-fallback`.
 * **Dedup** por banco (`tidal_dl.db`) + **sentinela** `.streamrip.json` em cada álbum completo (vídeos usam só o banco).

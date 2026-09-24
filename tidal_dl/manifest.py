@@ -5,13 +5,18 @@ Dois formatos chegam de ``playbackinfopostpaywall``:
   * ``application/vnd.tidal.bts``  -> JSON em base64, com UMA URL (arquivo inteiro);
   * ``application/dash+xml``       -> MPD em base64, com init + N segmentos.
 
-POLÍTICA DE PROTEÇÃO
---------------------
+POLÍTICA DE PROTEÇÃO E FALLBACK
+--------------------------------
 Este projeto só baixa streams SEM criptografia. Se o Tidal devolver um stream
 protegido (``encryptionType`` diferente de NONE), levantamos
 ``UnsupportedProtection`` e ``resolve_stream`` tenta a qualidade abaixo -- o
 fluxo PKCE normal entrega LOSSLESS/HI_RES_LOSSLESS sem proteção. Não há
 descriptografia aqui, de propósito.
+
+Fallback só é considerado para uma indisponibilidade explícita do tier
+(``403``, ausência de URL ou proteção não suportada). Erro de rede,
+autenticação, rate limit e manifesto inválido propagam sem tentar mascarar o
+problema com uma qualidade menor.
 """
 
 from __future__ import annotations
@@ -27,8 +32,10 @@ from tidal_dl.constants import QUALITY_MAP
 from tidal_dl.exceptions import (
     ForbiddenError,
     InvalidQuality,
+    ManifestError,
     NonStreamable,
     PreviewOnly,
+    QualityUnavailable,
     UnsupportedProtection,
 )
 from tidal_dl.models import Stream
@@ -62,34 +69,34 @@ def parse_dash(xml_text: str) -> tuple[str, list[str]]:
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError as exc:
-        raise NonStreamable(f"MPD ilegível: {exc}") from exc
+        raise ManifestError(f"MPD ilegível: {exc}") from exc
     rep = root.find(".//mpd:Representation", _NS)
     if rep is None:
-        raise NonStreamable("MPD sem Representation")
+        raise ManifestError("MPD sem Representation")
     codec = (rep.get("codecs") or "").lower()
     tmpl = rep.find("mpd:SegmentTemplate", _NS)
     if tmpl is None:
         tmpl = root.find(".//mpd:SegmentTemplate", _NS)
     if tmpl is None:
-        raise NonStreamable("MPD sem SegmentTemplate")
+        raise ManifestError("MPD sem SegmentTemplate")
     init, media = tmpl.get("initialization"), tmpl.get("media")
     if not init or not media:
-        raise NonStreamable("SegmentTemplate sem initialization/media")
+        raise ManifestError("SegmentTemplate sem initialization/media")
     start = int(tmpl.get("startNumber", "1"))
     timeline = tmpl.find("mpd:SegmentTimeline", _NS)
     if timeline is None:
-        raise NonStreamable("MPD sem SegmentTimeline")
+        raise ManifestError("MPD sem SegmentTimeline")
     count = sum(1 + int(s.get("r", "0")) for s in timeline.findall("mpd:S", _NS))
     if count <= 0:
-        raise NonStreamable("SegmentTimeline sem segmentos")
+        raise ManifestError("SegmentTimeline sem segmentos")
     return codec, [init] + [media.replace("$Number$", str(start + i)) for i in range(count)]
 
 
 def _decode_b64(text: str) -> bytes:
     try:
-        return base64.b64decode(text)
+        return base64.b64decode(text, validate=True)
     except (binascii.Error, ValueError) as exc:
-        raise NonStreamable(f"manifest base64 inválido: {exc}") from exc
+        raise ManifestError(f"manifest base64 inválido: {exc}") from exc
 
 
 def stream_from_playback(info: dict, track_id: int) -> Stream:
@@ -120,12 +127,12 @@ def stream_from_playback(info: dict, track_id: int) -> Stream:
     try:
         manifest = json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError) as exc:
-        raise NonStreamable(f"manifest BTS ilegível: {exc}") from exc
+        raise ManifestError(f"manifest BTS ilegível: {exc}") from exc
     urls = manifest.get("urls") or []
     if not urls:
         restrictions = manifest.get("restrictions") or []
         code = restrictions[0].get("code") if restrictions and isinstance(restrictions[0], dict) else None
-        raise NonStreamable(f"sem URL no manifesto ({code or 'restrito'})")
+        raise QualityUnavailable(f"sem URL no manifesto ({code or 'restrito'})")
     if _is_protected(manifest.get("encryptionType")):
         raise UnsupportedProtection(f"stream protegido ({manifest.get('encryptionType')})")
     return Stream(codec=str(manifest.get("codecs") or ""), urls=list(urls), is_dash=False, **common)
@@ -171,6 +178,8 @@ async def resolve_stream(
         except PreviewOnly:
             raise
         except (ForbiddenError, NonStreamable) as exc:
+            if isinstance(exc, ManifestError):
+                raise
             logger.debug("tier preferido %s indisponível para %s: %s", preferred_tier, track_id, exc)
     last: Optional[Exception] = None
     for rank in range(quality, -1, -1):
@@ -181,6 +190,8 @@ async def resolve_stream(
         except PreviewOnly:
             raise  # descer de qualidade não resolve prévia
         except (ForbiddenError, NonStreamable) as exc:
+            if isinstance(exc, ManifestError):
+                raise
             last = exc
             logger.debug("faixa %s indisponível em %s: %s", track_id, name, exc)
             if not allow_fallback or rank == 0:
