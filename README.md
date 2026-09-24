@@ -10,6 +10,7 @@ Irmão do **qobuz-dl-ultra**: mesma organização de código, mesma pasta/nome d
 * [📥 Instalação](#-instalação)
   * [📱 iPhone/iPad (a-Shell)](#-iphoneipad-a-shell)
   * [💻 Desktop / servidor](#-desktop--servidor)
+* [↺ Resetar e limpar](#-resetar-e-limpar)
 * [🔑 Login](#-login)
 * [💻 Uso](#-uso)
 * [🗂️ Catálogo local, scan e sync](#️-catálogo-local-scan-e-sync)
@@ -20,15 +21,20 @@ Irmão do **qobuz-dl-ultra**: mesma organização de código, mesma pasta/nome d
 
 ## ✨ Funcionalidades
 
-* **Lossless e Hi-Res** (FLAC até 24-bit/192 kHz conforme o plano) e AAC. Se a qualidade pedida não existir para uma faixa, o programa **desce um degrau por vez** até uma que sirva (`--no-fallback` desliga).
+* **Lossless e Hi-Res** (FLAC até 24-bit/192 kHz conforme o plano) e AAC. O programa respeita o máximo publicado pelo álbum e mostra a qualidade real de cada faixa (por exemplo, `24bit/48kHz`). Só desce um degrau quando a API confirma que o tier está indisponível (`--no-fallback` desliga); falha de rede, autenticação, rate limit ou manifesto inválido não vira fallback silencioso.
 * **Python puro, sem ffmpeg obrigatório.** O Tidal entrega Hi-Res como DASH (FLAC dentro de MP4 fragmentado); o remux para FLAC nativo é feito em Python (`fmp4.py`), sem re-encode. ffmpeg é só plano B.
-* **Funciona no a-Shell**: núcleo com `httpx`, `mutagen` e `colorama` (todos Python puro), sem keyring (token em arquivo `0600`), sem `aiosqlite`/`tenacity`/`tqdm`, saída adaptada a tela estreita.
+* **Funciona no a-Shell**: dependências obrigatórias sem extensão nativa (`httpx`, `mutagen`, `colorama`, `prompt_toolkit` e `tqdm`), sem keyring por padrão (token em arquivo `0600`), sem `aiosqlite`/`tenacity`; saída adaptada a tela estreita. `rapidfuzz`, `brotli` e `cryptography` ficam opcionais porque podem exigir wheels específicos no iOS.
 * **Tags completas**: título/artista/álbum, faixa/disco, data, ISRC, `BARCODE` (UPC), copyright, BPM, **ReplayGain de faixa e álbum**, capa, letra e IDs do Tidal (`TIDALTRACKID`, `TIDALALBUMID`) — os IDs permitem ao `scan` reconhecer seus álbuns com certeza. FLAC e M4A.
+* **Vídeos identificados**: MP4 recebe título, artista, álbum, data, capa e `TIDALVIDEOID`; quando o formato inevitável é MPEG-TS, as mesmas informações ficam em um sidecar JSON ao lado do vídeo.
 * **Letras**: embutidas nas tags e, quando sincronizadas, também em `.lrc`.
 * **Retomada inteligente**: pasta `[IN PROGRESS]` durante o download; se algo falha vira `[INCOMPLETE]` e a próxima execução só baixa o que faltou. Arquivos temporários usam `~tmp_` (sem ponto, para o app Arquivos do iOS).
-* **Álbuns, faixas, playlists (com `.m3u8`) e artistas**, multi-disco em `CD 01`, `CD 02`.
-* **Dedup** por banco (`tidal_dl.db`) + **sentinela** `.streamrip.json` em cada álbum completo.
-* **Somente streams sem criptografia.** Se o Tidal devolver um stream protegido, o programa tenta a qualidade abaixo; não há descriptografia no projeto.
+* **Álbuns, faixas, playlists (com `.m3u` e `.m3u8`), artistas e vídeos musicais**, multi-disco em `CD 01`, `CD 02`. Vídeos associados a álbuns ficam em `video_directory/Albums/...`, fora da árvore de músicas.
+* **Vídeo (HLS)**: escolhe a variante pela qualidade (`--video-quality low/medium/high`), decripta segmentos AES-128 quando o CDN usa (mecanismo padrão do próprio HLS, não é DRM), remux para `.mp4` via ffmpeg quando disponível — sem ffmpeg, fica um `.ts` (toca normalmente no VLC e na maioria dos players).
+* **Letras com reforço**: usa a letra do Tidal quando existe; se não existir, tenta **Musixmatch** e depois [LRCLIB](https://lrclib.net) — sempre de forma assíncrona, sem travar outros downloads. Desative com `--no-lyrics-fallback`.
+* **Letras retroativas**: `tidal-dl lyrics [DIR]` preenche letras em FLAC/M4A/MP3 que já estão na biblioteca, sem baixar o áudio novamente. Use `--dry-run` para revisar ou `--force` para substituir letras existentes.
+* **Diagnóstico por item**: o resumo mostra índice de faixa/vídeo, qualidade alvo, qualidade entregue e o motivo de qualquer limitação ou fallback.
+* **Dedup** por banco (`tidal_dl.db`) + **sentinela** `.streamrip.json` em cada álbum completo (vídeos usam só o banco).
+* **Somente streams de áudio sem criptografia.** Se o Tidal devolver um stream de áudio protegido, o programa tenta a qualidade abaixo; não há descriptografia de áudio no projeto. (Vídeo é diferente: a criptografia AES-128 do HLS é padrão do formato, resolvida com a própria chave que o manifesto entrega — não é DRM.)
 
 ## 📥 Instalação
 
@@ -76,6 +82,15 @@ tidal-dl login
 
 Docker (NAS): `docker build -t tidal-dl-ultra . && docker run -it -v ./config:/config -v ./downloads:/downloads tidal-dl-ultra login`.
 
+## ↺ Resetar e limpar
+
+```sh
+tidal-dl -r            # roda o assistente de configuração (cria ou substitui o config.ini)
+tidal-dl -p            # apaga o banco de downloads-já-feitos (tidal_dl.db) -- não mexe nos arquivos
+```
+
+Na primeira vez que você rodar qualquer comando sem ter um `config.ini`, o assistente roda sozinho.
+
 ## 🔑 Login
 
 ```sh
@@ -96,8 +111,11 @@ O token fica em `credentials.json` (permissão 0600) ao lado do `config.ini`, ou
 ```sh
 tidal-dl dl https://tidal.com/browse/album/123456          # álbum
 tidal-dl dl https://tidal.com/browse/track/123456 -q 2     # faixa em FLAC 16-bit
-tidal-dl dl https://tidal.com/browse/playlist/UUID         # playlist (+ .m3u8)
+tidal-dl dl https://tidal.com/browse/playlist/UUID         # playlist (+ .m3u/.m3u8)
+tidal-dl lyrics ~/Music                                      # completa letras locais
+tidal-dl inspect ~/Music --json                              # confere qualidade e tags
 tidal-dl dl https://tidal.com/browse/artist/123 --eps      # discografia (+ EPs/singles)
+tidal-dl dl https://tidal.com/browse/video/123456 --video-quality high
 tidal-dl dl lista.txt                                      # várias URLs, uma por linha
 
 tidal-dl search daft punk                # busca de álbuns; escolha por número (1,3-5)
@@ -109,7 +127,15 @@ tidal-dl stats                           # estatísticas do que você baixou
 
 Qualidades (`-q`): `0` AAC 96 · `1` AAC 320 · `2` FLAC 16/44.1 · `3` Hi-Res legado · `4` FLAC até 24/192.
 
-Opções úteis: `-d PASTA`, `-ff` / `-tf` (formatos), `--concurrency N`, `--delay SEG`, `--no-db`, `--no-lyrics`, `--no-cover`, `--no-sentinel`, `--remux auto|python|ffmpeg|none`.
+Opções úteis: `-d PASTA`, `-ff` / `-tf` (formatos), `--max-workers N` (1 = sequencial com barra; >1 = paralelo), `--delay SEG` (força sequencial), `--no-progress`, `--no-db`, `--no-lyrics`, `--no-lyrics-fallback`, `--no-cover`, `--no-sentinel`, `--remux auto|python|ffmpeg|none`, `--video-directory PASTA`, `--video-quality low|medium|high`.
+
+### Modo sequencial x paralelo
+
+* **Sequencial** (`--max-workers 1`, o padrão): uma faixa por vez, com barra de progresso em tempo real. Melhor para acompanhar o que está acontecendo e para conexões instáveis (cada faixa retoma de onde parou se cair).
+* **Paralelo** (`--max-workers N`, N > 1): várias faixas ao mesmo tempo. Barras desenhadas por cima umas das outras ficam ilegíveis, então cada faixa mostra uma linha "Em Progresso" e depois "Concluído".
+* `--delay` sempre força o modo sequencial ("Safety Delay"), mesmo com `--max-workers` alto.
+
+Cada álbum/faixa/playlist termina com um resumo (📊) mostrando quantas faixas foram baixadas, puladas, tiveram fallback de qualidade ou falharam.
 
 ### Variáveis de formatação
 
@@ -156,7 +182,7 @@ O `scan` decide por: tag `TIDALALBUMID` → UPC → nome exato → fuzzy. Só ma
 | Windows | `%APPDATA%\tidal-dl\` |
 | Qualquer | `$CONFIG_DIR/tidal-dl/` (tem prioridade) |
 
-Chaves principais: `directory`, `quality`, `allow_quality_fallback`, `folder_format`, `track_format`, `embed_art`, `save_cover_file`, `lyrics`, `save_lrc`, `concurrency`, `retries`, `remux`, `no_database`, `write_sentinel`, `disable_keyring`. Argumento na linha de comando > `config.ini` > padrão.
+Chaves principais: `directory`, `video_directory`, `quality`, `video_quality`, `allow_quality_fallback`, `folder_format`, `track_format`, `embed_art`, `save_cover_file`, `lyrics`, `lyrics_fallback`, `save_lrc`, `max_workers`, `progress_bar`, `retries`, `remux`, `no_database`, `write_sentinel`, `disable_keyring`. Argumento na linha de comando > `config.ini` > padrão.
 
 ## 🔧 Solução de problemas
 
@@ -180,5 +206,7 @@ Os testes usam um Tidal falso (`tests/unit/fakes.py`, `scenario.py`): nunca toca
 ## ⚠️ Aviso legal
 
 Este projeto é independente e **não é afiliado ao Tidal**. Use apenas com a sua própria assinatura, para uso pessoal, e respeite os Termos de Serviço e as leis de direitos autorais do seu país. Você é responsável pelo uso que fizer. As credenciais de cliente OAuth embutidas são as usadas pela comunidade de ferramentas Tidal e podem ser substituídas por variáveis de ambiente (`TIDAL_DL_CLIENT_ID`, `TIDAL_DL_CLIENT_SECRET`, `TIDAL_DL_CLIENT_ID_PKCE`, `TIDAL_DL_CLIENT_SECRET_PKCE`).
+
+O download de vídeo foi implementado e testado com manifestos HLS sintéticos (inclusive com segmentos criptografados), mas nunca contra o CDN real do Tidal -- avise se algo não bater. A criptografia AES-128 que ele eventualmente decripta é o mecanismo padrão do próprio formato HLS (a chave vem no manifesto entregue pela sua sessão autenticada), não um DRM como Widevine/FairPlay. O fallback de letras tenta Musixmatch e depois consulta o [LRCLIB](https://lrclib.net), um banco aberto mantido justamente para esse tipo de consulta; desative com `--no-lyrics-fallback` se preferir usar só as letras do próprio Tidal.
 
 Licença: GPL-3.0 (ver `LICENSE`).

@@ -74,7 +74,24 @@ def test_album_inexistente_devolve_false(tmp_path):
 def test_tipo_desconhecido(tmp_path):
     sc, t = make(tmp_path)
     with pytest.raises(TidalDLException):
-        run(t.download_from_id(1, "xyz"))
+        run(t.download_from_id(1, "mix"))
+
+
+def test_video_via_url_chama_download_video(tmp_path, monkeypatch):
+    sc, t = make(tmp_path)
+    vistos = []
+
+    async def fake_download_video(video_id):
+        vistos.append(video_id)
+        from tidal_dl.downloader import AlbumResult, TrackResult
+
+        r = AlbumResult(video_id, "V", "A")
+        r.tracks = [TrackResult(video_id, "V", success=True)]
+        return r
+
+    monkeypatch.setattr(t.downloader, "download_video", fake_download_video)
+    assert run(t.handle_url("https://tidal.com/browse/video/555")) is True
+    assert vistos == ["555"]
 
 
 def test_faixa_e_playlist_e_artista(tmp_path):
@@ -91,18 +108,24 @@ def test_lucky_e_busca_vazia(tmp_path):
                                            "releaseDate": "2020-01-01", "audioQuality": "LOSSLESS"})[1].startswith("A - X")
 
 
-def test_interactive_com_selecao(tmp_path):
+def test_interactive_com_selecao(tmp_path, monkeypatch):
     sc, t = make(tmp_path)
 
-    async def ask():
-        return "1"
+    # interactive() agora abre a TUI em tela cheia (prompt_toolkit) em vez
+    # de pedir um número por input() de texto -- mocka core._tui_select
+    # (mesma técnica usada nos testes do qobuz-dl-ultra) pra não precisar
+    # de um terminal de verdade rodando em CI.
+    async def escolhe_primeiro(title, options, is_multi=False, item_category="album"):
+        return [(options[0], 0)]
 
-    assert run(t.interactive("art", "album", ask=ask)) is True
+    monkeypatch.setattr(core, "_tui_select", escolhe_primeiro)
+    assert run(t.interactive("art", "album")) is True
 
-    async def nada():
-        return "q"
+    async def cancela(title, options, is_multi=False, item_category="album"):
+        raise KeyboardInterrupt
 
-    assert run(t.interactive("art", "album", ask=nada)) is False
+    monkeypatch.setattr(core, "_tui_select", cancela)
+    assert run(t.interactive("art", "album")) is False
 
 
 def test_refresh_renovado_e_persistido(tmp_path):

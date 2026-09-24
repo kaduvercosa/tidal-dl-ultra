@@ -34,6 +34,7 @@ OPTIONAL_MODULES = {
     "platformdirs": "pasta de config padrão do sistema",
     "rapidfuzz": "match fuzzy mais rápido no scan",
     "brotli": "respostas HTTP comprimidas",
+    "cryptography": "baixar vídeos com segmentos HLS criptografados (AES-128)",
 }
 
 

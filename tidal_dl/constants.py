@@ -30,6 +30,27 @@ QUALITY_LABELS = {
 }
 DEFAULT_QUALITY = 4
 
+# Codecs Dolby (Atmos) entregues pelo Tidal via DASH/BTS junto de faixas
+# normais -- não têm profundidade/taxa de amostragem PCM comum (o conceito
+# "16bit/44.1kHz" não se aplica), então são rotulados à parte no terminal e
+# no nome de pasta/arquivo em vez de herdar o bit_depth "de mentirinha" que
+# o manifesto às vezes devolve pra eles.
+#
+# IMPORTANTE: o identificador de codec no manifesto (RFC 6381, atributo
+# "codecs" do MPD/BTS) normalmente vem HIFENIZADO -- "ec-3" (E-AC-3/Dolby
+# Digital Plus, usado no JOC/Atmos) e "ac-4" (Dolby AC-4), não "eac3"/"ac4"
+# "colados". A lista cobre as duas formas (com e sem hífen/mais) porque o
+# valor exato pode variar; ANTES só "eac3"/"ac4" estavam aqui e nunca davam
+# match em "ec-3"/"ac-4" de verdade -- a faixa caía no branch normal (que
+# assume FLAC/AAC) e acabava rotulada/tratada como se fosse áudio comum.
+DOLBY_CODECS = ("eac3", "ec-3", "ec+3", "ac-4", "ac4", "atmos")
+
+# Tier de qualidade que pede explicitamente o stream Dolby Atmos original
+# (em vez de deixar o Tidal decidir e devolver um downmix estéreo comum na
+# qualidade "normal" pedida). Só é tentado quando a própria faixa/álbum já
+# informa "DOLBY_ATMOS" como o audioQuality dela.
+DOLBY_ATMOS_TIER = "DOLBY_ATMOS"
+
 # Nome padrão de pasta/arquivo (mesma filosofia do qobuz-dl-ultra).
 # Placeholders de pasta: album_artist, album_title, year, format, bit_depth,
 #   sampling_rate, album_id, release_type

@@ -2,3 +2,5 @@
 httpx
 mutagen
 colorama>=0.4.6
+prompt_toolkit
+tqdm

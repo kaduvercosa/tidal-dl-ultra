@@ -22,7 +22,13 @@ from tidal_dl.constants import (
     TRACK_PLACEHOLDERS,
 )
 from tidal_dl.exceptions import ConfigError
-from tidal_dl.utils import atomic_write_text, default_download_folder, is_ios, validate_template
+from tidal_dl.utils import (
+    atomic_write_text,
+    default_download_folder,
+    default_video_folder,
+    is_ios,
+    validate_template,
+)
 
 SECTION = "tidal"
 
@@ -30,9 +36,9 @@ SECTION = "tidal"
 @dataclass
 class TidalDLSettings:
     directory: str = field(default_factory=default_download_folder)
-    video_directory: str = "TidalVideos"
+    video_directory: str = field(default_factory=default_video_folder)
     quality: int = DEFAULT_QUALITY
-    video_quality: str = "1080p"  # 1080p, 720p, 480p, 360p, max
+    video_quality: str = "HIGH"  # LOW | MEDIUM | HIGH (enum da API, não resolução em pixels)
     allow_quality_fallback: bool = True
     folder_format: str = DEFAULT_FOLDER
     track_format: str = DEFAULT_TRACK
@@ -41,14 +47,14 @@ class TidalDLSettings:
     save_cover_file: bool = True  # cover.jpg na pasta do álbum
     cover_size: int = 1280
     lyrics: bool = True  # embute letra
+    lyrics_fallback: bool = True  # tenta Musixmatch e depois LRCLIB quando o Tidal não tem a letra
     save_lrc: bool = True  # grava .lrc quando há letra sincronizada
-    genius_token: str = ""
-    lyrics_translation_lang: str = "pt"
     no_database: bool = False
     write_sentinel: bool = True
     disable_keyring: bool = field(default_factory=is_ios)  # a-Shell não tem keyring
-    concurrency: int = 2  # faixas simultâneas (2 é gentil com iPhone)
-    retries: int = 3
+    max_workers: int = 1  # 1 = sequencial (com barra); >1 = paralelo (sem barras)
+    progress_bar: bool = True
+    retries: int = 5
     requests_per_minute: int = 240
     delay: float = 0.0  # pausa (s) entre faixas
     remux: str = "auto"  # auto | python | ffmpeg | none
@@ -62,7 +68,10 @@ class TidalDLSettings:
             raise ConfigError(f"quality inválida: {self.quality} (use 0-4)")
         if self.remux not in ("auto", "python", "ffmpeg", "none"):
             raise ConfigError(f"remux inválido: {self.remux}")
-        self.concurrency = max(1, min(int(self.concurrency), 8))
+        self.video_quality = (self.video_quality or "HIGH").upper()
+        if self.video_quality not in ("LOW", "MEDIUM", "HIGH"):
+            raise ConfigError(f"video_quality inválida: {self.video_quality} (use LOW, MEDIUM ou HIGH)")
+        self.max_workers = max(1, min(int(self.max_workers), 16))
         self.retries = max(1, min(int(self.retries), 10))
         for name, tpl, allowed in (
             ("folder_format", self.folder_format, FOLDER_PLACEHOLDERS),
@@ -86,18 +95,17 @@ class TidalDLSettings:
         except configparser.Error as exc:
             raise ConfigError(f"config.ini ilegível: {exc}") from exc
         base = cls()
-        section = SECTION if cfg.has_section(SECTION) else "DEFAULT"
-        if not cfg.has_section(section) and section != "DEFAULT":
+        if not cfg.has_section(SECTION):
             return base
         kwargs: dict[str, Any] = {}
         for f in fields(cls):
-            if not cfg.has_option(section, f.name):
+            if not cfg.has_option(SECTION, f.name):
                 continue
-            raw = cfg.get(section, f.name)
+            raw = cfg.get(SECTION, f.name)
             default = getattr(base, f.name)
             try:
                 if isinstance(default, bool):
-                    kwargs[f.name] = cfg.getboolean(section, f.name)
+                    kwargs[f.name] = cfg.getboolean(SECTION, f.name)
                 elif isinstance(default, int):
                     kwargs[f.name] = int(raw)
                 elif isinstance(default, float):
@@ -105,7 +113,7 @@ class TidalDLSettings:
                 else:
                     kwargs[f.name] = raw
             except ValueError as exc:
-                raise ConfigError(f"valor inválido em [{section}] {f.name}={raw!r}") from exc
+                raise ConfigError(f"valor inválido em [{SECTION}] {f.name}={raw!r}") from exc
         st = cls(**kwargs)
         st.directory = os.path.expanduser(st.directory)
         st.video_directory = os.path.expanduser(st.video_directory)
@@ -116,32 +124,46 @@ class TidalDLSettings:
         mapping = {
             "directory": "directory", "video_directory": "video_directory", "quality": "quality",
             "video_quality": "video_quality", "folder_format": "folder_format",
-            "track_format": "track_format", "concurrency": "concurrency", "delay": "delay",
+            "track_format": "track_format", "max_workers": "max_workers", "delay": "delay",
             "remux": "remux",
         }
         for arg, attr in mapping.items():
             val = getattr(args, arg, None)
             if val is not None:
+                if attr == "video_quality":
+                    val = str(val).upper()
                 setattr(self, attr, os.path.expanduser(val) if attr in ("directory", "video_directory") else val)
         if getattr(args, "no_db", False):
             self.no_database = True
         if getattr(args, "no_sentinel", False):
             self.write_sentinel = False
+        if getattr(args, "no_progress", False):
+            self.progress_bar = False
         if getattr(args, "no_lyrics", False):
             self.lyrics = False
+        if getattr(args, "no_lyrics_fallback", False):
+            self.lyrics_fallback = False
         if getattr(args, "no_fallback", False):
             self.allow_quality_fallback = False
         if getattr(args, "no_cover", False):
             self.embed_art = False
             self.save_cover_file = False
-        if self.directory and is_ios() and not os.path.isabs(self.directory):
-            ios_home = os.environ.get("TIDAL_DL_IOS_HOME")
+        if is_ios():
+            # ANTES: só prefixava se a variável TIDAL_DL_IOS_HOME estivesse
+            # setada explicitamente -- mas is_ios() também detecta o a-Shell
+            # sozinho (via "Containers/Data/Application" no $HOME), e nesse
+            # caso `ios_home` ficava vazio e o prefixo nunca era aplicado,
+            # deixando pastas relativas passadas por -d/-D (ou lidas de um
+            # config.ini antigo) resolverem contra o CWD em vez de
+            # ~/Documents. Mesma auto-detecção do default_video_folder().
+            ios_home = os.environ.get("TIDAL_DL_IOS_HOME") or os.path.join(
+                os.environ.get("HOME", ""), "Documents"
+            )
             if ios_home:
-                self.directory = os.path.join(ios_home, self.directory)
-        if self.video_directory and is_ios() and not os.path.isabs(self.video_directory):
-            ios_home = os.environ.get("TIDAL_DL_IOS_HOME")
-            if ios_home:
-                self.video_directory = os.path.join(ios_home, self.video_directory)
+                if self.directory and not os.path.isabs(self.directory):
+                    self.directory = os.path.join(ios_home, self.directory)
+                if self.video_directory and not os.path.isabs(self.video_directory):
+                    self.video_directory = os.path.join(ios_home, self.video_directory)
         self.validate()
         return self
 

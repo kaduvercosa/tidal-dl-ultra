@@ -170,6 +170,11 @@ def unicode_enabled():
     return _unicode_enabled
 
 
+def is_quiet():
+    """True quando --quiet está ativo (barras de progresso também ficam mudas)."""
+    return _quiet
+
+
 def configure(quiet=None, verbose=None, color=None, unicode=None):
     # Ponto único de ajuste do comportamento global da UI. Chamado uma vez,
     # no boot da CLI, com os valores vindos dos argumentos de linha de
@@ -314,10 +319,13 @@ def ok(message):
     _emit_tagged(SUCCESS, "+", message)
 
 
-def step(message):
+def step(message, plain=False):
     # Mensagem de etapa em andamento -- prefixo "[*]" na cor de destaque.
+    # plain=True usa a cor padrão do terminal (sem destaque), pra mensagens
+    # que não devem competir visualmente com as etapas coloridas (ex.: busca
+    # de letras, que já tem seu próprio resultado colorido em ok()/warn()).
     """Print a progress step message (arrow icon)."""
-    _emit_tagged(HIGHLIGHT, "*", message)
+    _emit_tagged(RESET if plain else HIGHLIGHT, "*", message)
 
 
 def info(message):

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 
 import pytest
 
@@ -19,6 +20,12 @@ def env(monkeypatch, tmp_path):
     monkeypatch.delenv("TIDAL_DL_IOS_HOME", raising=False)
     monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
     monkeypatch.setenv("HOME", str(tmp_path))
+    # config.ini já existe por padrão: evita disparar o assistente de primeira
+    # execução no meio de testes que não são sobre ele (ver test_primeira_execucao_*).
+    from tidal_dl.settings import TidalDLSettings
+    from tidal_dl.utils import get_config_paths
+
+    TidalDLSettings().save(get_config_paths()["config_file"])
 
 
 @pytest.mark.parametrize("argv,attrs", [
@@ -96,10 +103,50 @@ def test_logout_apaga_token(tmp_path):
     assert run(["logout"]) == 0 and store.load() is None
 
 
-def test_config_show_e_reset(tmp_path, capsys):
+def test_config_show(tmp_path, capsys):
     assert run(["config", "--show"]) == 0
     assert "quality" in capsys.readouterr().out
-    assert run(["config", "--reset"]) == 0
+
+
+def test_reset_global_roda_o_assistente_uma_unica_vez(monkeypatch, capsys):
+    import builtins
+    # -r/--reset é o ÚNICO "reset" do programa (o antigo `config --reset`, que
+    # só apagava o arquivo sem perguntar nada, foi removido: colidia com esta
+    # flag global e confundia -- "reset" agora sempre quer dizer "assistente").
+    respostas = iter(["", "", "", "", "", "", "", "", ""])
+    monkeypatch.setattr(builtins, "input", lambda prompt="": next(respostas, ""))
+    assert run(["-r"]) == 0
+    out = capsys.readouterr().out
+    assert "CONFIGURAÇÃO" in out and out.count("CONFIGURAÇÃO") == 1  # não rodou 2x
+    from tidal_dl.utils import get_config_paths
+    assert os.path.isfile(get_config_paths()["config_file"])
+
+
+def test_purge_apaga_o_banco_de_downloads(tmp_path, capsys):
+    from tidal_dl import db
+    from tidal_dl.utils import get_config_paths
+
+    db_path = get_config_paths()["tidal_db"]
+    db.init_db(db_path)
+    assert os.path.isfile(db_path)
+    assert run(["-p"]) == 0
+    assert "apagado" in capsys.readouterr().out
+    assert not os.path.isfile(db_path)
+    assert run(["-p"]) == 0  # idempotente: não existe mais, não quebra
+    assert "Não havia" in capsys.readouterr().out
+
+
+def test_primeira_execucao_roda_assistente_automaticamente(monkeypatch, tmp_path, capsys):
+    import builtins
+    from tidal_dl.utils import get_config_paths
+
+    os.remove(get_config_paths()["config_file"])  # simula instalação nova (sem env fixture)
+    respostas = iter([""] * 9)
+    monkeypatch.setattr(builtins, "input", lambda prompt="": next(respostas, ""))
+    assert run(["stats"]) == 0  # comando comum: o assistente roda ANTES, sozinho
+    out = capsys.readouterr().out
+    assert "CONFIGURAÇÃO" in out and "Nenhum download registrado" in out  # rodou o wizard E o comando pedido
+    assert os.path.isfile(get_config_paths()["config_file"])
 
 
 def test_config_invalido_retorna_2(tmp_path):

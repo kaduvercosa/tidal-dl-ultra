@@ -36,7 +36,7 @@ COMMAND_DESCRIPTIONS_PT = {
     "login": "Entra na sua conta Tidal (PKCE: Lossless/Hi-Res). Use --device só se não puder colar uma URL (AAC).",
     "logout": "Apaga o token salvo neste aparelho.",
     "user": "Mostra conta, país, plano de assinatura e a qualidade máxima liberada.",
-    "dl": "Baixa por URL de álbum, faixa, playlist ou artista do Tidal, ou um .txt com uma lista de URLs.",
+    "dl": "Baixa por URL de álbum, faixa, playlist, artista ou vídeo do Tidal, ou um .txt com uma lista de URLs.",
     "search": "Busca interativa: procura álbuns/faixas/artistas/playlists e escolhe o que baixar por número.",
     "lucky": "Baixa os N primeiros resultados de uma busca, sem passar URL.",
     "sync-favorites": "Sincroniza seus álbuns favoritos com o catálogo local (novos/removidos) e baixa o que falta.",
@@ -168,12 +168,12 @@ def print_welcome(parser: argparse.ArgumentParser, paths: dict, settings) -> Non
         label = name if not aliases else f"{name} ({aliases})"
         ui.wrapped(f"{ACCENT}{label}{OFF}", indent=2)
         ui.wrapped(COMMAND_DESCRIPTIONS_PT.get(name, help_text), indent=4)
-    ui.blank()
+        ui.blank()
 
     ui.emit(f"{ACCENT}{BG}FLAGS GLOBAIS:{RESET} {MUTED}(valem para qualquer comando){OFF}\n" if cols >= 62
             else f"{BG}FLAGS GLOBAIS:{RESET}\n")
     for flag_str, dest, help_text in extract_global_flags(parser):
-        ui.emit(f"  {ACCENT}{flag_str}{OFF}")
+        ui.emit(f" {ACCENT}{flag_str}{OFF}")
         ui.wrapped(FLAG_DESCRIPTIONS_PT.get(dest, help_text), indent=4)
-    ui.blank()
+        ui.blank()
     ui.rule("=")

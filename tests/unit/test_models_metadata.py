@@ -75,3 +75,121 @@ def test_lyrics():
     assert ly.plain_lyrics({"lyrics": "abc"}) == "abc"
     assert ly.plain_lyrics({"subtitles": lrc}) == "oi\ntchau"
     assert ly.plain_lyrics({}) == ""
+
+
+# ---------------------------------------------------------------------------
+# Fallback de letras (LRCLIB) -- assíncrono, nunca levanta
+# ---------------------------------------------------------------------------
+
+import asyncio  # noqa: E402
+import json  # noqa: E402
+
+from fakes import jresp, make_client  # noqa: E402
+
+
+def _run(c):
+    return asyncio.run(c)
+
+
+def test_lrclib_sucesso_com_album():
+    seen = {}
+
+    def handler(method, url, params, data, headers):
+        seen.update(params)
+        assert url == ly.LRCLIB_URL
+        return jresp({"plainLyrics": "la la", "syncedLyrics": "[00:01.00] la la"})
+
+    client, _ = make_client(handler)
+    data = _run(ly.fetch_lrclib_lyrics(client, "Artista", "Musica", "Album"))
+    assert data == {"lyrics": "la la", "subtitles": "[00:01.00] la la"}
+    assert seen == {"artist_name": "Artista", "track_name": "Musica", "album_name": "Album"}
+
+
+def test_lrclib_sem_album_no_segundo_pedido_quando_o_primeiro_falha():
+    calls = []
+
+    def handler(method, url, params, data, headers):
+        calls.append(dict(params))
+        if "album_name" in params:
+            return jresp({}, 404)
+        return jresp({"plainLyrics": "x", "syncedLyrics": ""})
+
+    client, _ = make_client(handler)
+    data = _run(ly.fetch_lrclib_lyrics(client, "A", "T", "Alb"))
+    assert data == {"lyrics": "x", "subtitles": ""}
+    assert len(calls) == 2 and "album_name" not in calls[1]
+
+
+def test_lrclib_sem_album_uma_chamada_so():
+    calls = []
+
+    def handler(method, url, params, data, headers):
+        calls.append(params)
+        return jresp({}, 404)
+
+    client, _ = make_client(handler)
+    assert _run(ly.fetch_lrclib_lyrics(client, "A", "T")) == {}
+    assert len(calls) == 1
+
+
+def test_lrclib_nunca_levanta():
+    def handler(method, url, params, data, headers):
+        raise RuntimeError("boom")
+
+    client, _ = make_client(handler)
+    assert _run(ly.fetch_lrclib_lyrics(client, "A", "T")) == {}
+
+
+def test_lrclib_resposta_nao_e_objeto():
+    client, _ = make_client(lambda *a: jresp([1, 2, 3]))
+    assert _run(ly.fetch_lrclib_lyrics(client, "A", "T")) == {}
+
+
+def test_musixmatch_busca_token_e_letra_lrc():
+    def handler(method, url, params, data, headers):
+        if url == ly.MXM_TOKEN_URL:
+            return jresp({"message": {"header": {"status_code": 200},
+                                      "body": {"user_token": "temporary"}}})
+        assert url == ly.MXM_SUBTITLES_URL
+        assert params["q_artist"] == "Artista" and params["q_track"] == "Musica"
+        return jresp({
+            "message": {
+                "header": {"status_code": 200},
+                "body": {
+                    "macro_calls": {
+                        "track.subtitles.get": {
+                            "message": {
+                                "header": {"status_code": 200},
+                                "body": {"subtitle_list": [{
+                                    "subtitle": {"subtitle_body": "[00:01.00] la la"}
+                                }]},
+                            }
+                        }
+                    }
+                },
+            }
+        })
+
+    client, _ = make_client(handler)
+    data = _run(ly.fetch_musixmatch_lyrics(client, "Artista", "Musica"))
+    assert data["lyrics"] == "la la"
+    assert data["subtitles"] == "[00:01.00] la la"
+    assert data["_source"] == "Musixmatch"
+
+
+def test_musixmatch_normaliza_richsync_json():
+    raw = json.dumps([
+        {"text": "primeira", "time": {"total": 1.25}},
+        {"text": "segunda", "time": {"total": 3.5}},
+    ])
+    plain, lrc = ly._musixmatch_body_to_text(raw)
+    assert plain == "primeira\nsegunda"
+    assert lrc == "[00:01.250] primeira\n[00:03.500] segunda"
+
+
+def test_musixmatch_resposta_captcha_nao_derruba():
+    def handler(method, url, params, data, headers):
+        return jresp({"message": {"header": {"status_code": 401}}}, 401)
+
+    client, _ = make_client(handler)
+    assert _run(ly.fetch_musixmatch_lyrics(client, "A", "T")) == {}

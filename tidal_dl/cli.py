@@ -9,14 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
 import sys
 from typing import Optional
 
 from tidal_dl import db as dbm, ui
 from tidal_dl.auth import CredentialStore, login_device, login_pkce
-from tidal_dl.color import ACCENT_PRESETS, OFF, GREEN, YELLOW, BG, accent_preview
 from tidal_dl.commands import build_parser
 from tidal_dl.constants import QUALITY_LABELS, TMP_PREFIX
 from tidal_dl.core import TidalDL, read_url_file
@@ -31,142 +29,25 @@ from tidal_dl.utils import clean_leftovers, get_config_paths
 
 OFFLINE = {
     "doctor": "doctor", "check": "doctor", "scan": "scan", "library-scan": "scan",
-    "library": "library", "lib": "library", "stats": "stats", "config": "config",
+    "library": "library", "lib": "library", "stats": "stats", "lyrics": "lyrics",
+    "inspect": "inspect", "config": "config",
     "logout": "logout",
 }
 SYNC = {"sync-favorites", "sf"}
-DOWNLOAD_CMDS = {"dl", "search", "fun", "i", "lucky"}
-
-
-def _pick_accent_color() -> str:
-    """Seletor interativo da cor de destaque para o assistente de configuração."""
-    ui.emit(f"\n{BG}[?] Cor de destaque do programa:{OFF}")
-    ui.wrapped("Aparece em nomes de faixas, cabeçalhos, barras e progresso.", indent=4)
-    ui.blank()
-
-    for idx, (name, _rgb, escape) in enumerate(ACCENT_PRESETS, 1):
-        if escape:
-            preview = accent_preview(escape, "━━ [FAIXA] ARTISTA The Weeknd")
-            ui.emit(f" {idx:2}. {name:<22} {preview}")
-        else:
-            ui.emit(f" {idx:2}. {name}")
-
-    ui.blank()
-    while True:
-        _n = len(ACCENT_PRESETS)
-        prompt = f"Escolha (1-{_n}) [Enter = 1 padrão]: "
-        if len(prompt) > ui.width():
-            prompt = f"Escolha 1-{_n}: "
-        choice = input(prompt).strip()
-        if not choice:
-            choice = "1"
-        try:
-            idx = int(choice)
-            if 1 <= idx <= len(ACCENT_PRESETS):
-                name, rgb, escape = ACCENT_PRESETS[idx - 1]
-                break
-        except ValueError:
-            pass
-        ui.emit(f" Por favor escolha entre 1 e {len(ACCENT_PRESETS)}.")
-
-    if rgb is None:
-        ui.emit("\n Digite os valores RGB separados por ponto e vírgula.")
-        ui.emit(" Exemplo: 255;100;50 (vermelho), 0;200;150 (teal)\n")
-        while True:
-            raw = input(" Código RGB (R;G;B): ").strip()
-            raw = raw.replace(",", ";").replace(" ", ";")
-            parts_str = [x.strip() for x in raw.split(";") if x.strip()]
-            try:
-                parts = [int(x) for x in parts_str]
-                if len(parts) == 3 and all(0 <= p <= 255 for p in parts):
-                    rgb = ";".join(str(p) for p in parts)
-                    escape = ui.c(f"\033[38;2;{parts[0]};{parts[1]};{parts[2]}m")
-                    break
-            except ValueError:
-                pass
-            ui.emit(" Formato inválido. Use três números de 0 a 255, ex: 150;80;220")
-
-    ui.emit("\n Preview da sua cor:")
-    ui.emit(accent_preview(escape, "━━ [FAIXA] ARTISTA The Weeknd"))
-    confirm = input(" Confirmar esta cor? (Enter = sim, n = escolher outra): ").strip().lower()
-    if confirm in ("n", "nao", "no"):
-        return _pick_accent_color()
-
-    ui.emit(f"\n {GREEN}Cor salva: {escape}━━ {name.strip()}{OFF}\n")
-    return rgb
-
-
-async def _reset_config(config_file: str) -> TidalDLSettings:
-    """Executa o assistente de configuração interativa no terminal e salva no config.ini."""
-    if ui.width() >= 41:
-        ui.emit(f"\n{BG}[ TIDAL-DL-ULTRA - CONFIGURAÇÃO INICIAL ]{OFF}")
-    else:
-        ui.emit(f"\n{BG}[ CONFIGURAÇÃO INICIAL ]{OFF}")
-
-    st = TidalDLSettings()
-    accent_rgb = _pick_accent_color()
-    st.accent_color = accent_rgb
-    c_accent = ui.c(f"\033[38;2;{accent_rgb}m") if accent_rgb else ui.c(YELLOW)
-
-    st.directory = os.path.expanduser(
-        input(f"\nPasta de downloads de áudio [Padrão: '{st.directory}']:\n- ").strip() or st.directory
-    )
-    st.video_directory = os.path.expanduser(
-        input(f"\nPasta de downloads de vídeos [Padrão: '{st.video_directory}']:\n- ").strip() or st.video_directory
-    )
-
-    ui.emit(f"\n{c_accent}[?] Qualidade de áudio padrão:{OFF}")
-    for k, v in QUALITY_LABELS.items():
-        ui.emit(f"  {k}: {v}")
-    q_str = input(f"Escolha a qualidade (0-4) [Padrão: {st.quality}]:\n- ").strip()
-    if q_str.isdigit() and int(q_str) in QUALITY_LABELS:
-        st.quality = int(q_str)
-
-    ui.emit(f"\n{c_accent}[?] Qualidade de vídeo padrão:{OFF}")
-    ui.emit("  Opções: 1080p, 720p, 480p, 360p, max")
-    vq = input(f"Qualidade de vídeo [Padrão: {st.video_quality}]:\n- ").strip().lower()
-    if vq in ("1080p", "720p", "480p", "360p", "max"):
-        st.video_quality = vq
-
-    fetch_lyr = input("\nBaixar e embutir letras automaticamente? (yes/no) [Padrão: yes]\n- ").strip().lower()
-    st.lyrics = False if fetch_lyr in ("no", "n", "false") else True
-
-    if st.lyrics:
-        ui.emit(f"\n{c_accent}[?] Idioma de Tradução de Letras:{OFF}")
-        ui.emit("  Opções: pt (Português), en (Inglês), es (Espanhol), fr (Francês), original (Manter nativo)")
-        lang = input("Idioma [Padrão: pt]:\n- ").strip().lower()
-        st.lyrics_translation_lang = "" if lang in ("original", "orig") else (lang if lang in ("pt", "en", "es", "fr", "de", "it") else "pt")
-
-        ui.emit(f"\n{c_accent}[!] Para usar o Genius como fallback de letras, insira seu API Token (Enter para pular):{OFF}")
-        st.genius_token = input("Genius API Token:\n- ").strip()
-
-    st.save(config_file)
-    ui.ok(f"Configuração salva com sucesso em {config_file}!")
-    return st
+DOWNLOAD_CMDS = {"dl", "search", "fun", "i", "lucky"} | SYNC
 
 
 def _load_settings(paths: dict, args) -> TidalDLSettings:
-    cfg = paths["config_file"]
-    if not os.path.exists(cfg):
-        try:
-            st = TidalDLSettings.from_config(cfg)
-        except ConfigError:
-            st = TidalDLSettings()
-    else:
-        try:
-            st = TidalDLSettings.from_config(cfg)
-        except ConfigError as exc:
-            ui.warn(f"Erro ao ler config.ini: {exc}")
-            st = TidalDLSettings()
-    return st.apply_args(args)
+    settings = TidalDLSettings.from_config(paths["config_file"])
+    return settings.apply_args(args)
+
+
+# ---------------------------------------------------------------------------
+# login / user / logout
+# ---------------------------------------------------------------------------
 
 
 async def cmd_login(args, settings: TidalDLSettings, paths: dict, http=None) -> int:
-    cfg_file = paths["config_file"]
-    if not os.path.exists(cfg_file) and sys.stdin and sys.stdin.isatty():
-        ui.info("Configuração inicial não encontrada. Iniciando assistente de configuração...")
-        settings = await _reset_config(cfg_file)
-
     store = CredentialStore(paths["credentials_file"], use_keyring=not settings.disable_keyring)
     http = http or create_client()
     try:
@@ -278,50 +159,41 @@ async def _prompt(text: str, default: str) -> str:
 
 async def cmd_config(args, paths: dict) -> int:
     cfg_file = paths["config_file"]
-    if getattr(args, "reset", False):
-        try:
-            os.remove(cfg_file)
-            ui.ok("config.ini apagado.")
-        except FileNotFoundError:
-            ui.info("Não havia config.ini.")
-        return 0
-
     try:
         st = TidalDLSettings.from_config(cfg_file)
     except ConfigError as exc:
         ui.warn(f"{exc} -- começando dos padrões.")
         st = TidalDLSettings()
-
     if getattr(args, "show", False):
         ui.banner("TIDAL-DL-ULTRA  ·  CONFIG")
         ui.kv("Arquivo", cfg_file)
         for key, val in vars(st).items():
             ui.kv(key, val)
         return 0
-
     ui.banner("TIDAL-DL-ULTRA  ·  CONFIGURAÇÃO")
     ui.info("Enter mantém o valor entre colchetes.")
-    st.directory = os.path.expanduser(await _prompt("Pasta de downloads de áudio", st.directory))
-    st.video_directory = os.path.expanduser(await _prompt("Pasta de downloads de vídeos", st.video_directory))
-
+    st.directory = os.path.expanduser(await _prompt("Pasta de downloads", st.directory))
     for k, v in QUALITY_LABELS.items():
         ui.detail(f"{k} = {v}", indent=2)
     while True:
-        q = await _prompt("Qualidade de áudio (0-4)", str(st.quality))
+        q = await _prompt("Qualidade (0-4)", str(st.quality))
         if q.isdigit() and int(q) in QUALITY_LABELS:
             st.quality = int(q)
             break
         ui.warn("Digite um número de 0 a 4.")
-
-    st.video_quality = await _prompt("Qualidade de vídeo (1080p, 720p, 480p, 360p, max)", st.video_quality)
     st.folder_format = await _prompt("Formato da pasta", st.folder_format)
     st.track_format = await _prompt("Formato da faixa", st.track_format)
-    st.concurrency = int(await _prompt("Faixas simultâneas (1-8)", str(st.concurrency)) or st.concurrency)
+    st.video_directory = os.path.expanduser(await _prompt("Pasta de downloads de vídeo", st.video_directory))
+    while True:
+        vq = (await _prompt("Qualidade de vídeo (low/medium/high)", st.video_quality.lower())).strip().upper()
+        if vq in ("LOW", "MEDIUM", "HIGH"):
+            st.video_quality = vq
+            break
+        ui.warn("Digite low, medium ou high.")
+    ui.detail("1 = sequencial (com barra de progresso); mais que 1 = paralelo (sem barras).", indent=2)
+    st.max_workers = int(await _prompt("Downloads paralelos (1-16)", str(st.max_workers)) or st.max_workers)
     lyr = await _prompt("Baixar letras? (s/n)", "s" if st.lyrics else "n")
     st.lyrics = lyr.lower().startswith(("s", "y"))
-    if st.lyrics:
-        st.genius_token = await _prompt("Genius API Token", st.genius_token)
-
     try:
         st.validate()
     except ConfigError as exc:
@@ -359,11 +231,16 @@ async def run_online(command: str, args, settings: TidalDLSettings, paths: dict)
             return await cmd_user(tidal)
         if command == "dl":
             summary = await tidal.download_urls(_expand_sources(args.SOURCE), include_eps=args.eps)
-            ui.blank()
-            ui.info(f"Concluído: {summary['ok']} ok, {summary['failed']} com falha.")
             return 1 if summary["failed"] else 0
         if command in ("search", "fun", "i"):
-            ok = await tidal.interactive(" ".join(args.QUERY), args.type)
+            if args.QUERY:
+                ok = await tidal.interactive(" ".join(args.QUERY), args.type)
+            else:
+                # Sem TERMO: abre o fluxo completo -- primeiro escolhe o tipo
+                # (ou "Favoritos"), depois pergunta o termo, só então mostra
+                # a tabela. Com TERMO já dado na linha de comando, continua
+                # indo direto pra busca (uso não-interativo/scripts).
+                ok = await tidal.interactive_menu()
             return 0 if ok else 1
         if command == "lucky":
             return 0 if await tidal.lucky(" ".join(args.QUERY), args.type, args.number) else 1
@@ -374,8 +251,9 @@ async def run_online(command: str, args, settings: TidalDLSettings, paths: dict)
         raise TidalDLException(f"comando desconhecido: {command}")
     finally:
         await tidal.aclose()
-        if os.path.isdir(settings.directory):
-            clean_leftovers(settings.directory, TMP_PREFIX)
+        for root in {settings.directory, settings.video_directory}:
+            if os.path.isdir(root):
+                clean_leftovers(root, TMP_PREFIX)
 
 
 async def async_main(argv: Optional[list[str]] = None) -> int:
@@ -386,6 +264,40 @@ async def async_main(argv: Optional[list[str]] = None) -> int:
 
     command = args.command
     paths = get_config_paths()
+
+    # `-r`/`--reset`: (re)cria o config.ini pelo assistente e sai. Também roda
+    # sozinho na primeira vez (config.ini ainda não existe) -- a MENOS que
+    # `-r`/`--reset` já tenha sido pedido explicitamente, para não rodar 2x.
+    first_run = not os.path.isfile(paths["config_file"])
+    if getattr(args, "reset", False) or (first_run and command):
+        import argparse as _argparse
+
+        rc = await cmd_config(_argparse.Namespace(show=False), paths)
+        if getattr(args, "reset", False):
+            if rc == 0:
+                # Reset deu certo: cai direto na página inicial (mesmo texto
+                # que apareceria rodando `tidal-dl` sem argumentos), em vez
+                # de só voltar pro shell -- evita ter que rodar o comando de
+                # novo pra ver os próximos passos.
+                from tidal_dl.welcome import print_welcome
+
+                try:
+                    settings = TidalDLSettings.from_config(paths["config_file"])
+                except ConfigError:
+                    settings = TidalDLSettings()
+                print_welcome(parser, paths, settings)
+            return rc
+
+    # `-p`/`--purge`: apaga o banco de downloads-já-feitos e sai (sem pedir
+    # confirmação, igual ao qobuz-dl-ultra -- é reversível, só perde o dedup).
+    if getattr(args, "purge", False):
+        try:
+            os.remove(paths["tidal_db"])
+            ui.ok("O banco de dados de downloads foi apagado.")
+        except FileNotFoundError:
+            ui.info("Não havia banco de dados para apagar.")
+        return 0
+
     if not command:
         from tidal_dl.welcome import print_welcome
 
@@ -410,6 +322,14 @@ async def async_main(argv: Optional[list[str]] = None) -> int:
                 return cmd_stats(paths)
             if kind == "config":
                 return await cmd_config(args, paths)
+            if kind == "lyrics":
+                from tidal_dl.lyrics_cmd import cmd_lyrics
+
+                return await cmd_lyrics(args, directory=directory)
+            if kind == "inspect":
+                from tidal_dl.inspect_cmd import cmd_inspect
+
+                return await cmd_inspect(args, directory=directory)
             from tidal_dl import doctor
             from tidal_dl.library_cmd import cmd_library, cmd_scan
 

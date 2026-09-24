@@ -25,12 +25,15 @@ dependencies = [
     "httpx",
     "mutagen",
     "colorama>=0.4.6",
+    "prompt_toolkit",
+    "tqdm",
 ]
 
 [project.optional-dependencies]
 speed = ["rapidfuzz", "brotli"]
 keyring = ["keyring"]
-all = ["tidal-dl-ultra[speed,keyring]", "platformdirs"]
+video = ["cryptography"]
+all = ["tidal-dl-ultra[speed,keyring,video]", "platformdirs"]
 dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.6"]
 
 [project.scripts]

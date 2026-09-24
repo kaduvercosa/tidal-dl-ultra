@@ -47,21 +47,29 @@ def b64(s) -> str:
 
 
 class FakeStream:
-    def __init__(self, status, content, headers=None):
-        self.status, self.headers, self._c = status, headers or {}, content
+    def __init__(self, status, content, headers=None, cut_after=None):
+        self.status, self.headers, self._c, self._cut = status, headers or {}, content, cut_after
 
     async def iter_chunks(self, size):
+        from tidal_dl.net import NetworkError
+
+        if self._cut is not None:  # conexão cai no meio do arquivo
+            if self._cut:
+                yield self._c[: self._cut]
+            raise NetworkError("conexão caiu")
         for i in range(0, len(self._c), size):
             yield self._c[i:i + size]
 
 
 class FakeBackend:
-    """Roteia por (método, URL). ``routes``: função (method, url, params, data, headers)->Response."""
+    """Roteia por (método, URL). ``handler``: (method, url, params, data, headers) -> Response."""
 
     def __init__(self, handler=None):
         self.calls: list[tuple] = []
         self.handler = handler
         self.files: dict[str, bytes] = {}
+        self.cut: dict[str, int] = {}  # url -> bytes entregues antes de a conexão cair (uma vez)
+        self.honor_range = True
 
     async def request(self, method, url, *, params=None, data=None, headers=None, timeout=None):
         self.calls.append((method, url, params, data, headers))
@@ -72,10 +80,21 @@ class FakeBackend:
     @contextlib.asynccontextmanager
     async def stream(self, url, *, headers=None, timeout=None):
         self.calls.append(("STREAM", url, None, None, headers))
-        if url in self.files:
-            yield FakeStream(200, self.files[url])
-        else:
+        if url not in self.files:
             yield FakeStream(404, b"")
+            return
+        data = self.files[url]
+        rng = (headers or {}).get("Range", "")
+        start, status, hdrs = 0, 200, {}
+        if rng.startswith("bytes=") and self.honor_range:
+            start = int(rng.split("=")[1].split("-")[0])
+            if start >= len(data):
+                yield FakeStream(416, b"", {"content-range": f"bytes */{len(data)}"})
+                return
+            status = 206
+            hdrs["content-range"] = f"bytes {start}-{len(data) - 1}/{len(data)}"
+        hdrs["content-length"] = str(len(data) - start)
+        yield FakeStream(status, data[start:], hdrs, cut_after=self.cut.pop(url, None))
 
     async def aclose(self):
         pass
